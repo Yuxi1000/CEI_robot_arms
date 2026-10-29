@@ -22,8 +22,6 @@ DEFAULT_JOINT_UPDATE_HZ = 100.0
 # 0.05 s per step, so 3 degrees per step caps joint speed near 60 deg/s.
 MAX_JOINT_STEP_DEG = 3.0
 DEFAULT_MAX_CHUNK_JOINT_DEG = 100.0
-# Exit status of `apply` when a chunk fails a limit check; nothing was sent.
-REFUSED_EXIT = 3
 
 
 class ChunkRefused(RuntimeError):
@@ -146,8 +144,16 @@ def check_limits(waypoints, pose, config):
     return reach
 
 
-def apply_actions(actions):
-    """Enable the arm and play the returned chunk.
+def require_healthy_drivers(robot):
+    """Raise before any motion frame when a joint driver reports a fault."""
+    faults = robot.driver_faults()
+    if faults:
+        listed = "; ".join(f"J{joint}: {', '.join(names)}" for joint, names in faults.items())
+        raise RuntimeError(f"joint driver fault ({listed}). Nothing sent. Power-cycle the arm to clear it")
+
+
+def apply_actions(robot, actions):
+    """Enable the arm and play the returned chunk on a connected PiperClient.
 
     execute_steps in team_config.json keeps only the first N steps (empty: all),
     and ee_delta_scale scales each step (empty: 1.0). A simulator-trained OSC
@@ -158,48 +164,48 @@ def apply_actions(actions):
     if config.get("execute_steps"):
         actions = actions[: int(config["execute_steps"])]
     scale = float(config.get("ee_delta_scale") or 1.0)
-    with PiperClient() as robot:
-        before = robot.read_state()
-        if not before["complete"]:
-            raise RuntimeError("arm feedback is incomplete")
-        waypoints, shift_mm, euler_error = action_waypoints(actions, before["pose_mm_deg"], scale)
-        if not waypoints:
-            raise RuntimeError("policy returned no actions")
-        reach_mm = check_limits(waypoints, before["pose_mm_deg"], config)
-        final = waypoints[-1]
-        print(
-            f"command_steps={len(waypoints)} scale={scale:g} shift_mm={shift_mm:.2f} reach_mm={reach_mm:.2f} "
-            f"euler_roundtrip_deg={euler_error:.3f} gripper_close={final['gripper_close']}",
-            flush=True,
+    before = robot.read_state()
+    if not before["complete"]:
+        raise RuntimeError("arm feedback is incomplete")
+    waypoints, shift_mm, euler_error = action_waypoints(actions, before["pose_mm_deg"], scale)
+    if not waypoints:
+        raise RuntimeError("policy returned no actions")
+    reach_mm = check_limits(waypoints, before["pose_mm_deg"], config)
+    final = waypoints[-1]
+    print(
+        f"command_steps={len(waypoints)} scale={scale:g} shift_mm={shift_mm:.2f} reach_mm={reach_mm:.2f} "
+        f"euler_roundtrip_deg={euler_error:.3f} gripper_close={final['gripper_close']}",
+        flush=True,
+    )
+    print(
+        "target_mm_deg="
+        f"x:{final['x']:.2f}, y:{final['y']:.2f}, z:{final['z']:.2f}, "
+        f"rx:{final['rx']:.2f}, ry:{final['ry']:.2f}, rz:{final['rz']:.2f}",
+        flush=True,
+    )
+    require_healthy_drivers(robot)
+    maximum = robot.gripper_max_mm()
+    print("exit_teach", flush=True)
+    robot.exit_drag_teach()
+    print("enabling", flush=True)
+    robot.enable_arm()
+    print("moving", flush=True)
+    for waypoint in waypoints:
+        gripper_target = 0.0 if waypoint["gripper_close"] else maximum
+        robot.move_pose(
+            waypoint["x"],
+            waypoint["y"],
+            waypoint["z"],
+            waypoint["rx"],
+            waypoint["ry"],
+            waypoint["rz"],
+            duration=STEP_SECONDS,
+            speed=POSE_SPEED,
+            gripper_mm=gripper_target,
         )
-        print(
-            "target_mm_deg="
-            f"x:{final['x']:.2f}, y:{final['y']:.2f}, z:{final['z']:.2f}, "
-            f"rx:{final['rx']:.2f}, ry:{final['ry']:.2f}, rz:{final['rz']:.2f}",
-            flush=True,
-        )
-        maximum = robot.gripper_max_mm()
-        print("exit_teach", flush=True)
-        robot.exit_drag_teach()
-        print("enabling", flush=True)
-        robot.enable_arm()
-        print("moving", flush=True)
-        for waypoint in waypoints:
-            gripper_target = 0.0 if waypoint["gripper_close"] else maximum
-            robot.move_pose(
-                waypoint["x"],
-                waypoint["y"],
-                waypoint["z"],
-                waypoint["rx"],
-                waypoint["ry"],
-                waypoint["rz"],
-                duration=STEP_SECONDS,
-                speed=POSE_SPEED,
-                gripper_mm=gripper_target,
-            )
-        print("pose_sent", flush=True)
-        reached = robot.move_gripper(0.0 if final["gripper_close"] else maximum)
-        after = robot.read_state()
+    print("pose_sent", flush=True)
+    reached = robot.move_gripper(0.0 if final["gripper_close"] else maximum)
+    after = robot.read_state()
     print(f"gripper_target_mm={0.0 if final['gripper_close'] else maximum:.1f} gripper_reached_mm={reached}")
     print("after")
     print(format_state(after))
@@ -222,69 +228,98 @@ def check_joint_chunk(actions, start, config):
     return reach
 
 
-def apply_joint_actions(actions, speed=None, update_hz=None):
-    """Play a chunk of absolute joint targets: columns 0-5 degrees, column 6 gripper (>= 0.5 closes).
+def apply_joint_actions(robot, actions, speed=None, update_hz=None):
+    """Play a chunk of absolute joint targets on a connected PiperClient: columns 0-5 degrees, column 6 gripper.
+
+    Column 6 is how far the gripper closes: 0 fully open (gripper_max_mm), 1 at
+    0 mm, values between partly closed, so a replayed grasp closes as far as
+    the recording did.
 
     speed (percent) falls back to joint_speed in team_config.json, then 60.
     update_hz is how often the target changes within a step; 20 holds one
     target per 0.05 s step.
     """
     actions = np.asarray(actions, dtype=float)
-    with PiperClient() as robot:
-        before = robot.read_state()
-        if not before["complete"]:
-            raise RuntimeError("arm feedback is incomplete")
-        config = load_config()
-        reach = check_joint_chunk(actions, before["joints_deg"], config)
-        speed = int(speed or config.get("joint_speed") or DEFAULT_JOINT_SPEED)
-        update_hz = float(update_hz or DEFAULT_JOINT_UPDATE_HZ)
-        final = actions[-1]
-        print(
-            f"command_steps={len(actions)} joint_reach_deg={reach:.1f} speed={speed} freq={update_hz:g} "
-            "target_joints_deg=" + ", ".join(f"J{i + 1}:{v:.1f}" for i, v in enumerate(final[:6])),
-            flush=True,
-        )
-        maximum = robot.gripper_max_mm()
+    before = robot.read_state()
+    if not before["complete"]:
+        raise RuntimeError("arm feedback is incomplete")
+    config = load_config()
+    reach = check_joint_chunk(actions, before["joints_deg"], config)
+    speed = int(speed or config.get("joint_speed") or DEFAULT_JOINT_SPEED)
+    update_hz = float(update_hz or DEFAULT_JOINT_UPDATE_HZ)
+    final = actions[-1]
+    print(
+        f"command_steps={len(actions)} joint_reach_deg={reach:.1f} speed={speed} freq={update_hz:g} "
+        "target_joints_deg=" + ", ".join(f"J{i + 1}:{v:.1f}" for i, v in enumerate(final[:6])),
+        flush=True,
+    )
+    require_healthy_drivers(robot)
+    maximum = robot.gripper_max_mm()
+    if before["status"]["ctrl_mode_name"] != "CAN_CTRL":
         robot.exit_drag_teach()
-        robot.enable_arm()
-        previous = before["joints_deg"]
-        for step in actions:
-            robot.move_joints(
-                step[:6],
-                duration=STEP_SECONDS,
-                speed=speed,
-                gripper_mm=0.0 if step[6] >= 0.5 else maximum,
-                start_deg=previous,
-                update_hz=update_hz,
-            )
-            previous = step[:6]
-        print("joints_sent", flush=True)
-        # Hold the last target briefly so the arm settles before the state is read.
-        robot.move_joints(final[:6], duration=0.5, speed=speed, gripper_mm=0.0 if final[6] >= 0.5 else maximum)
-        after = robot.read_state()
+    robot.enable_arm()
+    previous = before["joints_deg"]
+    for step in actions:
+        robot.move_joints(
+            step[:6],
+            duration=STEP_SECONDS,
+            speed=speed,
+            gripper_mm=maximum * (1.0 - min(1.0, max(0.0, float(step[6])))),
+            start_deg=previous,
+            update_hz=update_hz,
+        )
+        previous = step[:6]
+    print("joints_sent", flush=True)
+    # No settle wait: the controller keeps tracking the last target while the next chunk is inferred.
+    after = robot.read_state()
     print("after")
     print(format_state(after))
 
 
-def main():
-    if len(sys.argv) > 2 and sys.argv[1] == "apply":
-        import argparse
+def serve_motion():
+    """Worker for policy_link.MotionWorker: hold the arm and run requests from stdin until it closes.
 
-        parser = argparse.ArgumentParser()
-        parser.add_argument("command")
-        parser.add_argument("path")
-        parser.add_argument("action_space", nargs="?", default="ee_delta", choices=("ee_delta", "joints"))
-        parser.add_argument("--speed", type=int)
-        parser.add_argument("--freq", type=float)
-        args = parser.parse_args()
-        try:
-            if args.action_space == "joints":
-                apply_joint_actions(np.load(args.path), speed=args.speed, update_hz=args.freq)
-            else:
-                apply_actions(np.load(args.path))
-        except ChunkRefused as exc:
-            print(f"chunk_refused {exc}", flush=True)
-            sys.exit(REFUSED_EXIT)
+    Requests and replies are pickled tuples on stdin and stdout. Prints go to
+    stderr, so the terminal still shows them. Connecting once here, instead of
+    once per chunk, removes the reconnect and firmware check between chunks.
+    """
+    import pickle
+    import traceback
+
+    replies = sys.stdout.buffer
+    sys.stdout = sys.stderr
+    try:
+        with PiperClient() as robot:
+            while True:
+                try:
+                    request = pickle.load(sys.stdin.buffer)
+                except EOFError:
+                    break
+                try:
+                    if request[0] == "state":
+                        reply = ("ok", robot.read_state())
+                    elif request[0] == "joints":
+                        _kind, actions, speed, freq = request
+                        apply_joint_actions(robot, actions, speed=speed, update_hz=freq)
+                        reply = ("ok", None)
+                    else:
+                        apply_actions(robot, request[1])
+                        reply = ("ok", None)
+                except ChunkRefused as exc:
+                    print(f"chunk_refused {exc}", flush=True)
+                    reply = ("refused", str(exc))
+                except Exception:
+                    reply = ("error", traceback.format_exc())
+                pickle.dump(reply, replies)
+                replies.flush()
+    except KeyboardInterrupt:
+        # Ctrl+C reaches this process too; policy_link reports the stop.
+        pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "worker":
+        serve_motion()
         return
     infer_once("127.0.0.1", 8000)
 

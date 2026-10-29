@@ -36,11 +36,11 @@ python team_config.py once
 
 Stop the job and the forward with `python team_config.py down`. Check the arm without moving it with `python team_config.py arm`. Preview the camera with `python policy_link.py preview` (press q to close).
 
-On Windows, close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run. Do not run `python piper_client.py`; that command opens and closes the gripper.
+On Windows, close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run.
 
-To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. That also rebuilds `datasets/piper_finetune`. See `用户文档.md`.
+To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. That also rebuilds `datasets/piper_finetune`. See `用户文档.md`. To replay the newest recording on the arm, run `python policy_link.py replay` (add `--loop` to repeat it).
 
-Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websockets`. Recording also needs `pandas` and `pyarrow`. Mac also needs `pyusb`, `pyobjc-framework-AVFoundation`, and `brew install libusb`. The CAN client does not import `piper_sdk`: Windows uses WinUSB, and Mac uses libusb.
+Python packages used here are `numpy`, `opencv-python`, `msgpack`, `websockets`, `python-can`, and AgileX's `pyAgxArm` (`pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"`). Recording also needs `pandas` and `pyarrow`. Mac also needs `pyusb`, `pyobjc-framework-AVFoundation`, and `brew install libusb`. All CAN traffic goes through `pyAgxArm`; `piper_can_bus.py` lets it use the candleLight over USB on Windows and macOS.
 
 ## Files
 
@@ -51,7 +51,8 @@ Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websocke
 | `policy_link.py` | Observation, WebSocket loop, Astra Pro capture (`VID_2BC5` `PID_0501`), plus `preview`, `cameras`, `ready`, and `home` |
 | `simple_policy_server.py` | Scripted server for a link test, joint demo, or episode replay |
 | `policy_step.py` | Turns one 12-d chunk into base-frame pose commands |
-| `piper_client.py` | candleLight client: WinUSB on Windows, libusb on Mac |
+| `piper_client.py` | Arm client on the official `pyAgxArm` SDK |
+| `piper_can_bus.py` | CAN backend per platform for `pyAgxArm` |
 | `check_candidate_repo.py` | Search a candidate policy repo before changing the action mapping |
 | `_can_listen.py` | Receive-only CAN capture |
 | `collect.py` | Record, check, export, and rebuild `datasets/piper_finetune` after `s`. `--latest` does that for the newest episode |

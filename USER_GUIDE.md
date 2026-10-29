@@ -42,7 +42,7 @@ flowchart LR
 
 ## On a Mac
 
-Run the one-time setup in the developer guide (`brew install libusb` and the `.venv`), then use `.venv/bin/python` in place of `python` below. Before the first run:
+Run the one-time setup in the developer guide (`brew install libusb` and the `.venv`, which includes `python-can` and `pyAgxArm`), then use `.venv/bin/python` in place of `python` below. Before the first run:
 
 1. Allow camera access for Terminal (System Settings > Privacy & Security > Camera). The Astra Pro is found automatically; `.venv/bin/python policy_link.py preview` shows what it sees live, and q closes the window. Only if it picks the wrong camera, put the right number from `policy_link.py cameras` in `camera_index`.
 2. With `server_mode` set to `"simple"`, `.venv/bin/python team_config.py setup-remote` copies the test server to athena once. Fill `slurm_partition` first.
@@ -57,6 +57,14 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 ```
 
 `--freq` is how many times per second the joint target changes (default 100; 20 is the old stepwise behavior). `--speed` is the joint speed percent (default `joint_speed` in `team_config.json`). Each chunk prints the values it used.
+
+### Replay one recording on this computer
+
+```bash
+.venv/bin/python policy_link.py replay episodes/episode_...
+```
+
+Without a folder it plays the newest recording. No server is needed. A window shows the camera live (`--no-preview` hides it; over SSH there is no window). The arm unfolds to the ready pose (where every recording starts), moves slowly to the recording's first pose, plays it once, prints `replay_done`, and returns to the ready pose. Add `--loop` to keep replaying it, back through the ready pose each time, until `Ctrl+C`. The gripper only fully closes or fully opens: once the recording closed it by about a third of its widest opening, replay closes it to 0 mm (stopping on the object). Joints dragged past their limits (J5 beyond 70 degrees) are held at the limit. Leave drag-teach first. Recordings made on a Mac replay the same on Linux: copy the episode folder over.
 
 ### Replay a recording from the server
 
@@ -73,11 +81,10 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 .venv/bin/python team_config.py run --server openpi --ready
 ```
 
-`--ready` unfolds the arm to the ready pose first, because end-pose chunks from the folded pose only move the gripper. This model was trained in simulation: its full 50-step chunk integrates to 0.3–1.5 m, far more than the simulated arm moved. `execute_steps` (here 10) keeps only the first steps and `ee_delta_scale` (here 0.1) shrinks each one; with these, about 3 of 4 chunks stay within `max_chunk_shift_mm`. A chunk outside it prints `chunk_refused`, sends nothing, and the loop observes again. Expect small motions, not a finished task. Switching between `simple`, `replay`, and `openpi` needs `down` first; `run` refuses a job started in another mode. `.venv/bin/python policy_link.py ready` only unfolds the arm. `.venv/bin/python policy_link.py home` folds it back to the rest pose (all joints 0) at the same slow speed, gripper open; it needs no server. A move of more than `max_chunk_joint_deg` is refused; then move the arm closer by hand in drag-teach first.
+`--ready` unfolds the arm to the ready pose first, because end-pose chunks from the folded pose only move the gripper. This model was trained in simulation: its full 50-step chunk integrates to 0.3–1.5 m, far more than the simulated arm moved. `execute_steps` (here 10) keeps only the first steps and `ee_delta_scale` (here 0.1) shrinks each one; with these, about 3 of 4 chunks stay within `max_chunk_shift_mm`. A chunk outside it prints `chunk_refused`, sends nothing, and the loop observes again. Expect small motions, not a finished task. Switching between `simple`, `replay`, and `openpi` needs `down` first; `run` refuses a job started in another mode. `.venv/bin/python policy_link.py ready` only unfolds the arm. `.venv/bin/python policy_link.py home` folds it back to just above the rest pose (`home_deg` in `team_config.json`, default J2 10°, J3 −5°) at the same slow speed, gripper open; it needs no server. Do not set any joint of `home_deg` at its mechanical stop: that trips the joint driver, and then the arm ignores joint commands until it is power-cycled. A move of more than `max_chunk_joint_deg` is refused; then move the arm closer by hand in drag-teach first.
 
 ## Do not
 
-- Do not run `python piper_client.py`. That command opens the gripper fully and then closes it.
 - Do not run `run` or `once` while drag-teach is still on. While status stays `TEACHING` with `teach=1`, end-effector commands are ignored. Leave teach mode first so status can enter `CAN_CTRL`.
 - Leave room around the arm. `execute_steps` and `ee_delta_scale` shorten and shrink the chunk first. A chunk farther than `max_chunk_shift_mm` from its start is refused before anything is sent.
 - The language instruction is the `prompt` field in `policy_link.py`. Change that English sentence before a run. There is no separate command-line prompt.
@@ -87,13 +94,13 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 
 ## Record a demonstration
 
-This only stores a person dragging the arm. The program reads the arm and the camera and never moves the arm. Turn on drag-teach, then run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python`):
+This stores a person dragging the arm. First the program moves the arm to the ready pose, so every recording (and its replay) starts from the same place; add `--no-ready` to skip that. Then it asks you to turn on drag-teach and press Enter. While recording it only reads the arm and the camera, and a window shows the camera live (`--no-preview` hides it; over SSH there is no window). Run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
 
 ```powershell
 python collect.py --task "put the pen in the box"
 ```
 
-When the attempt is over, press one key in the same window (no Enter needed):
+When the attempt is over, press one key in the terminal or the camera window (no Enter needed):
 
 | Key | Result |
 | --- | --- |

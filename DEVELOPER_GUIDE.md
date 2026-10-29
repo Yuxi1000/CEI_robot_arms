@@ -4,13 +4,13 @@ This guide is for people changing the code or checking the protocol. Operating s
 
 ```mermaid
 flowchart TB
-  subgraph pc [Windows or macOS]
+  subgraph host [Windows, macOS or Linux]
     client[policy_link.py once]
-    armclient[piper_client.py]
+    armclient[piper_client.py on pyAgxArm]
     client --> armclient
   end
   subgraph bus [CAN 1 Mbps]
-    adapter[candleLight gs_usb]
+    adapter[candleLight]
   end
   subgraph cluster [Login node and compute node]
     tunnel[Login node ssh -L]
@@ -27,6 +27,7 @@ flowchart TB
 | You want to change or look up | Section |
 | --- | --- |
 | Read-only state and gripper motion | [piper_client.py](#piper_clientpy) |
+| CAN backend per platform, firmware profile | [Official SDK (pyAgxArm)](#official-sdk-pyagxarm) |
 | Fields sent to the model | [Observation contract](#observation-contract) |
 | How a returned chunk becomes pose commands | [Action contract](#action-contract) |
 | WebSocket and timeouts | [Policy link](#policy-link) |
@@ -40,9 +41,10 @@ flowchart TB
 
 | File | Role |
 | --- | --- |
-| `piper_client.py` | Opens candleLight (WinUSB on Windows, libusb on macOS), reads `0x2A1`–`0x2A8`, and sends gripper `0x159`, leave-teach `0x150`, enable `0x471`, MOVE P `0x151`, and end pose `0x152`–`0x154` |
+| `piper_client.py` | `PiperClient`: a thin layer on the official `pyAgxArm` SDK in degrees and millimetres. `read_state()`, `driver_faults()`, gripper, leave teach, enable, MOVE J, MOVE P. See [piper_client.py](#piper_clientpy) |
+| `piper_can_bus.py` | Picks the CAN backend for this platform and the firmware profile, and drives the adapter over USB on Windows and macOS. See [Official SDK (pyAgxArm)](#official-sdk-pyagxarm) |
 | `policy_link.py` | Builds the observation, keeps one WebSocket open, and loops inference. The camera and CAN writes are not in the same process |
-| `policy_step.py` | Integrates one action chunk into an end-effector trajectory in the base frame and writes it to CAN. It does not import `piper_sdk` at runtime |
+| `policy_step.py` | Integrates one action chunk into an end-effector trajectory in the base frame and writes it to CAN |
 | `team_config.json` | Login account, SSH alias, checkpoint, and log directory. Copy it from the tracked blank `team_config.example.json`; the real file is gitignored because the repository is public |
 | `team_config.py` | `run` submits the job, waits until it listens, opens one local forward, and starts continuous control. `once` starts another round while the forward is up. `down` cancels the job and closes the forward. `job` and `serve` still only print commands |
 | `simple_policy_server.py` | Scripted policy server for testing the link without a model. See [macOS and the simple server](#macos-and-the-simple-server) |
@@ -54,38 +56,74 @@ flowchart TB
 
 Paths are relative to the directory that contains this code. Do not put someone's desktop absolute path into the docs or into new code. Server paths come from `team_config.json`.
 
-`piper_sdk` and `piper_ros` are in the repository, but both use Linux `can0`. The control loop on Windows and macOS does not call them. CAN IDs and byte order were checked against the SDK; `piper_client.py` still sends the frames.
+All CAN traffic goes through AgileX's `pyAgxArm`. The older `piper_sdk` and `piper_ros` are not used and not in this repository.
 
-Running `python piper_client.py` queries the gripper limit and then performs one full open and close. The library call `read_state()` sends no motion command.
+## Official SDK (pyAgxArm)
+
+`pyAgxArm` is AgileX's current Python SDK for Piper and Nero. It opens the bus with only `can.interface.Bus(interface=..., channel=..., bitrate=...)` from `python-can`. Its own routes for this adapter:
+
+| Platform | pyAgxArm's route | With this candleLight (gs_usb, `1D50:606F`) |
+| --- | --- | --- |
+| Linux | `socketcan`, `can0` | Works |
+| Windows | `agx_cando` (`cando.dll`) | The DLL does not contain this adapter's WinUSB GUID; probably for another AgileX module. Not tested |
+| macOS | `slcan`, `/dev/ttyACM0` | Does not work: this adapter has no serial port |
+
+`piper_can_bus.py` fills the gap. It registers a `python-can` interface named `piper_usb` that drives the adapter directly over USB (WinUSB through ctypes on Windows, libusb through pyusb on macOS) and converts `can.Message` to and from the 20-byte gs_usb frame. Transmit echoes are dropped. The pyAgxArm code is not changed.
+
+```python
+from piper_can_bus import create_piper_arm
+robot = create_piper_arm()   # Linux with can0: socketcan; otherwise piper_usb
+robot.connect()
+```
+
+- `can_args()` picks the interface and channel: `socketcan` / `can0` when `/sys/class/net/can0` exists (`PIPER_CAN_INTERFACE` names another interface), otherwise `piper_usb`.
+- On Linux, `bring_up_can()` sets the interface to 1 Mbps and up when it is down (after a replug). That needs root.
+- `create_piper_arm()` asks the arm for its firmware version (a query, no motion) and picks the driver profile through `resolve_firmware_profile()`; pass `firmware=` to skip it. It waits until feedback is arriving first, because `get_firmware()` drops replies before the feedback rate is measured.
+- `open_bus()` returns a plain `python-can` bus on the same adapter, for `_can_listen.py`.
+
+pyAgxArm keeps a background thread that parses every feedback frame, so reads return the latest values at once. It reports radians and metres; `PiperClient` converts to degrees and millimetres.
+
+Never call `calibrate_gripper()` or `calibrate_joint()`: they send `0xAE` and write the current position as the zero point.
+
+What was checked:
+
+- IQ9075 (Linux, socketcan): `read_state()`, `driver_faults()`, `gripper_max_mm()`, `team_config.py arm` and `_can_listen.py` (58,026 frames in 25 s, about 200 Hz per high-speed ID). pyAgxArm `enable()`, `set_speed_percent(20)` and `move_j` turned J1 by +10° and back with no driver fault. Firmware `S-V1.9-0` resolves to profile `v189`.
+- macOS with the real adapter: pyAgxArm over `piper_usb` reads the same joints, flange pose and firmware as on IQ9075, at about 200 Hz feedback.
+- Offline with a fake adapter: `PiperClient` sends leave-teach `0x150` byte 2 `0x02`, enable `0x471`, MOVE J through `0x151`, interpolated `0x155`–`0x157`, and gripper `0x159` with the set-zero byte `0x00`.
+- Not yet run: `ready`/`home` and a policy chunk through the new `PiperClient`, and `piper_usb` on a real Windows adapter.
+
+Install: `pip install python-can "git+https://github.com/agilexrobotics/pyAgxArm.git"`, plus `pyusb` and `brew install libusb` on macOS. On IQ9075 (no pip), unpack the `python-can`, `packaging`, `typing_extensions`, `wrapt` (aarch64) and `pyAgxArm` wheels into `.pylib`. That Python has no `sqlite3`, which `python-can` imports for a log writer this project does not use; a stub `sqlite3.py` in `.pylib` is enough.
 
 ## piper_client.py
 
-`PiperClient` is a context manager. On Windows, connect opens WinUSB with overlapped I/O. On macOS it uses libusb. Both set the adapter to 1 Mbps for a 48 MHz clock and start the controller.
+`PiperClient` is a context manager. `connect()` calls `create_piper_arm()`, starts pyAgxArm's threads, and initialises the AgileX gripper effector. `close()` stops them and releases the adapter; it does not disable the arm, so the arm keeps holding its pose.
 
-`read_state(timeout=0.6)` sets `complete` to True only after all eight IDs below have arrived:
+`read_state(timeout=0.6)` returns the latest feedback, waiting up to `timeout` for it to arrive after connect. Feedback older than 0.5 s counts as missing. `complete` is True only when every field below is present:
 
 | Field | Source | Unit |
 | --- | --- | --- |
-| `joints_deg` | `0x2A5`–`0x2A7`, six values | degrees |
-| `gripper_mm` | first 4 bytes of `0x2A8` | millimeters |
-| `gripper_effort` | following uint16 in `0x2A8` | 0.001 N·m |
-| `gripper_status` | status byte of `0x2A8` | raw value |
-| `pose_mm_deg` | `x y z rx ry rz` from `0x2A2`–`0x2A4` | millimeters and degrees |
-| `status` | `0x2A1` | see the protocol section |
+| `joints_deg` | `get_joint_angles()` (`0x2A5`–`0x2A7`) | degrees |
+| `gripper_mm` | gripper `get_gripper_status()` (`0x2A8`) | millimeters |
+| `gripper_effort` | same, force | 0.001 N·m |
+| `gripper_status` | same, status byte | raw value |
+| `pose_mm_deg` | `get_flange_pose()` (`0x2A2`–`0x2A4`), `x y z rx ry rz` | millimeters and degrees |
+| `status` | `get_arm_status()` (`0x2A1`) | see the protocol section |
 
-Multi-byte integers are big-endian. Divide the raw value by 1000.
+Status names (`TEACHING`, `CAN_CTRL`, ...) come from the tables in `piper_client.py`, not from pyAgxArm, so recorded episodes and `dataset_export.py` keep the same strings.
 
-`gripper_max_mm()` sends query `0x477` with data `04 00 00 00 03 00 00 00`. If byte 1 of `0x47E` is 70 or 100, that value is used; otherwise the client falls back to 70. One arm answered 100. This query does not change the load setting.
+`driver_faults()` reads `get_driver_states()` for the six joints and returns `{joint: [fault names]}`; a joint with no fresh feedback is reported as `no feedback`.
 
-`move_gripper(target_mm, effort=1000)` sends only `0x159`. The target is limited to 0–100 mm and the effort to 0–5000. The frame is repeated about every 10 ms until feedback is within 1 mm of the target, or until 4 seconds pass. It does not enable the joints. Byte 7 stays 0 so the current position is not written as the zero point.
+`gripper_max_mm()` asks the gripper for its configured stroke (`get_gripper_teaching_pendant_param()`). 70 or 100 is used; otherwise it falls back to 70. One arm answered 100.
 
-One full gripper stroke has been verified, with the joint angles unchanged before and after. Read the actual angles from `read_state()` on site. Do not copy them into a shared config.
+`move_gripper(target_mm, effort=1000)` sends only the gripper command, repeated about every 10 ms until feedback is within 1 mm of the target or 4 seconds pass. The target is limited to 0–100 mm and the effort to 0–5000. It does not enable the joints, and the set-zero byte stays 0.
 
-`exit_drag_teach()` sends `0x150` with data `00 00 02 00 00 00 00 00`. That ends a drag-teach recording. It is not an emergency stop and it does not write the zero point. `enable_arm()` sends `0x471` with `07 02` and six zeros, enabling every joint. `set_pose_mode(speed)` sends `0x151`: CAN control, MOVE P, and the speed percent, with the installation byte left at 0. `move_pose(...)` sends big-endian `0x152` (X, Y), `0x153` (Z, RX), and `0x154` (RY, RZ), in 0.001 mm and 0.001 degrees, and repeats the mode frame for the same interval. It can repeat one gripper frame in that same interval.
+`exit_drag_teach()` sends pyAgxArm's `0x150` message with byte 2 = `0x02` (end drag-teach recording) five times. pyAgxArm has no public call for it, so this uses the driver's `_send_msg`. It is not an emergency stop and it does not write the zero point. `enable_arm()` calls `enable()`.
 
-While `0x2A1` control mode is `0x02` (`TEACHING`) and the teach byte is `0x01`, end-pose commands are not followed. After leaving teach mode, one verified motion ended in `CAN_CTRL` with `motion=0`, and the pose read back was close to the commanded target. Bit 6 of byte 6 in low-speed feedback `0x261`–`0x266` means that joint driver is enabled.
+`move_joints(...)` checks the targets against `JOINT_LIMITS_DEG`, sets the speed with `set_speed_percent()`, and calls `move_j` every 5 ms for `duration`, with the target interpolated from `start_deg` and advanced `update_hz` times per second. `move_pose(...)` calls `move_p` every 10 ms for `duration`. Both can repeat one gripper command in the same loop.
 
-Reads and writes use separate events. Each write waits for completion and drains the transmit echo; otherwise later writes stall. Close cancels pending I/O and releases the interface. It does not send the bus-stop control transfer, which hung the process. Putting the camera and CAN writes in one process exits with an access violation (`3221225477`), so `policy_link.py` hands the action array to a new `policy_step.py` process.
+While `0x2A1` control mode is `0x02` (`TEACHING`) and the teach byte is `0x01`, end-pose commands are not followed. Bit 6 of byte 6 in low-speed feedback `0x261`–`0x266` means that joint driver is enabled.
+
+Putting the camera and CAN writes in one process exited with an access violation (`3221225477`) on Windows, so the arm lives in a separate process. `policy_link.MotionWorker` starts `policy_step.py worker` once per session; that process connects the arm once and answers state reads and chunks as pickled tuples on its stdin and stdout, printing to stderr. `policy_link.py` keeps only the camera, as a `LiveCamera` that stays open and whose thread keeps the newest frame. Before this, every cycle reopened the camera and reconnected the arm twice, with a firmware check each time, and held the last target for 0.5 s, which left a pause of 1–3 s between chunks; it is now tens of milliseconds plus inference.
 
 ## Policy link
 
@@ -97,12 +135,12 @@ Order inside `once`:
 
 1. Retry the connection to `ws://host:port` up to 50 times, with a 2-second handshake timeout. `python team_config.py once` and `python policy_link.py once` without `--port` both use `local_forward_port`. `python policy_link.py serve` still listens on `127.0.0.1:8765` by default, which is the local placeholder server.
 2. Receive metadata within 30 seconds and print `server_connected`.
-3. Call `read_state()`. If it is incomplete, raise and do not send.
-4. `capture_color()` takes one RGB frame from the Orbbec Astra Pro color camera (USB `VID_2BC5` `PID_0501`) and pads it to 224×224. Other cameras on the same computer are not selected. `build_observation(state, image)` copies that same frame into all three image fields.
+3. Ask the motion worker for `read_state()`. If it is incomplete, raise and do not send.
+4. `LiveCamera.read_bgr()` returns the first frame captured after the call from the Orbbec Astra Pro color camera (USB `VID_2BC5` `PID_0501`), and `model_image()` turns it into RGB padded to 224×224. Other cameras on the same computer are not selected. `build_observation(state, image)` sends it as `observation/image`.
 5. Send the observation and print `image_mean` and `waiting_for_inference`.
 6. Wait up to 600 seconds. If the reply is a string, raise it as a `RuntimeError`. That is how an OpenPI server returns an exception.
-7. Print `actions_shape`. One verified return was `(50, 12)`. Then execute the whole chunk in a separate process, and print `pose_sent` plus the state read afterward.
-8. Return to step 3. `Ctrl+C` prints `stopped` and exits. The WebSocket stays open for the whole loop. The CAN client used to read state is closed before the motion process starts, so the two do not hold the adapter at the same time.
+7. Print `actions_shape`. One verified return was `(50, 12)`. Then the motion worker executes the whole chunk and prints `pose_sent` plus the state read right afterward (no settle wait).
+8. Return to step 3. `Ctrl+C` prints `stopped` and exits; the worker gets the same Ctrl+C and disconnects. The WebSocket, the camera, and the motion worker stay open for the whole loop. Only the worker opens the adapter.
 
 `python policy_link.py serve` is a local placeholder on `127.0.0.1:8765`. It only checks the observation shape currently in this code and returns a placeholder action. It is not a substitute for anyone's checkpoint.
 
@@ -131,7 +169,7 @@ The order of these 16 numbers is written in `piper_train_state()`, bit-for-bit t
 | 13 | base quaternion w | 1.0 |
 | 14–15 | two finger joint positions, meters | opening in millimeters divided by 2000, opposite signs (22 mm is about `0.011, -0.011`) |
 
-Do not change the msgpack packing. The frame must be RGB: `capture_color()` already flips OpenCV's BGR and the server does not flip it back. This control loop does not use a camera extrinsic, and no hand-eye calibration was done.
+Do not change the msgpack packing. The frame must be RGB: `model_image()` already flips OpenCV's BGR and the server does not flip it back. This control loop does not use a camera extrinsic, and no hand-eye calibration was done.
 
 ## Action contract
 
@@ -149,16 +187,16 @@ Do not change the msgpack packing. The frame must be RGB: `capture_color()` alre
 
 ## macOS and the simple server
 
-Windows and macOS are both supported. `piper_client.py` chooses the transport by platform: `_WinUsbTransport` on Windows and `_LibUsbTransport` (pyusb, VID `1D50` / PID `606F`) on macOS. `open_transport()` sends the same gs_usb control transfers for both, and the 20-byte frames, echo draining, and every CAN ID are shared. `_can_listen.py` uses the libusb transport on macOS.
+On Windows and macOS, `piper_can_bus.py` drives the candleLight over USB: `_WinUsbTransport` (ctypes, overlapped I/O) on Windows and `_LibUsbTransport` (pyusb, VID `1D50` / PID `606F`) on macOS. `open_transport()` sends the same gs_usb control transfers for both to start the bus at 1 Mbps for a 48 MHz clock. Close does not send the bus-stop control transfer, which hung the process.
 
-The libusb transport drains the IN endpoint from a background thread into a 256-frame queue (about 0.1 s of feedback; the oldest frame is dropped when full). Without that, feedback at about 2,700 frames/s exhausts the adapter's frame buffers and OUT writes time out with errno 60 after about a dozen frames. Do not go back to reading only between writes.
+The libusb transport drains the IN endpoint from a background thread into a 256-frame queue (about 0.1 s of feedback; the oldest frame is dropped when full). Without that, feedback at about 2,700 frames/s exhausts the adapter's frame buffers and OUT writes time out with errno 60 after about a dozen frames. This is why python-can's own `gs_usb` backend is not used. On Windows, reads and writes share one WinUSB handle and buffer, so `PiperUsbBus` serialises them with a lock.
 
 Setup on a Mac:
 
 ```bash
 brew install libusb
 python3 -m venv .venv
-.venv/bin/pip install numpy msgpack 'websockets>=13' opencv-python pyusb pyobjc-framework-AVFoundation pandas pyarrow
+.venv/bin/pip install numpy msgpack 'websockets>=13' opencv-python pyusb pyobjc-framework-AVFoundation pandas pyarrow python-can "git+https://github.com/agilexrobotics/pyAgxArm.git"
 ```
 
 OpenCV on macOS numbers cameras in `uniqueID` order and cannot select one by USB ID. `_avfoundation_devices()` rebuilds that order through pyobjc, and the Astra Pro is the device whose model ID contains `VendorID_11205 ProductID_1281` (0x2BC5 / 0x0501). A non-empty `camera_index` in `team_config.json` overrides it. `python policy_link.py cameras` lists indexes with names. `python policy_link.py preview [--index N]` opens a live window with the 224×224 model input inset; q closes it. Camera access must be allowed for the app that runs the command.
@@ -167,9 +205,21 @@ OpenCV on macOS numbers cameras in `uniqueID` order and cannot select one by USB
 
 `simple_policy_server.py` returns a scripted `(50, 12)` chunk with the action meaning in `action_waypoints()`: +X by 10 mm and back, and the gripper alternating between chunks. With `server_mode` set to `"simple"`, `team_config.py setup-remote` copies it, `policy_link.py`, and `piper_client.py` to `remote_code_dir` and builds a venv there; `run` then submits it without a GPU. `"openpi"` keeps the `serve_policy.py` launch. Off Windows, the local forward is `ssh -f -N -L` in the background, and `down` stops it with `pkill`.
 
+## Linux and IQ9075
+
+Verified on a Qualcomm IQ9075 (aarch64 Yocto, Python 3.12) with the arm and the Astra Pro plugged in directly.
+
+- CAN: the Linux kernel's gs_usb driver owns the adapter as `can0`, and pyAgxArm uses python-can's `socketcan` backend on it. `bring_up_can()` brings `can0` up at 1 Mbps after a replug; that needs root.
+- Camera: `_v4l2_camera_index()` picks the `/dev/videoN` with USB IDs `2BC5:0501` and V4L2 index 0 (the capture node), opened with `CAP_V4L2`. A non-empty `camera_index` overrides it.
+- Python there has no pip, `ensurepip`, `venv` or `sqlite3`. Download `manylinux` aarch64 cp312 wheels on another machine (`pip download --only-binary=:all: --platform manylinux2014_aarch64 --python-version 3.12 ...`), unzip them into `.pylib` in the code directory, and run with `PYTHONPATH=.pylib`. See [Official SDK (pyAgxArm)](#official-sdk-pyagxarm) for the `sqlite3` stub.
+
+Driver faults: a joint driven into its mechanical stop trips overcurrent and disables that joint's driver; the controller then ignores every joint command while the gripper still works. `PiperClient.driver_faults()` reads byte 5 of `0x261`–`0x266`, and `policy_step.require_healthy_drivers()` refuses to send any motion frame while a fault is set. Power-cycle the arm to clear it.
+
+`policy_link.py home` goes to `home_deg` from `team_config.json`, or `HOME_DEG` (J2 10°, J3 −5°), just above the folded rest pose. All zeros drove J2 into its stop on one arm and tripped that fault. Set `home_deg` per arm to the rest pose read on site, a little short of each stop.
+
 ## Joint-space actions
 
-End-pose (MOVE P) targets from the folded rest pose are rejected by the arm's IK: status shows `TARGET_EXCEEDS_LIMIT` and only the gripper moves. A reply may therefore carry `"action_space": "joints"` with actions `(N, 7)`: six absolute joint angles in degrees and a gripper value (at or above 0.5 closes). `policy_link.py` passes the action space to `policy_step.py apply`; a reply without it is `ee_delta`.
+End-pose (MOVE P) targets from the folded rest pose are rejected by the arm's IK: status shows `TARGET_EXCEEDS_LIMIT` and only the gripper moves. A reply may therefore carry `"action_space": "joints"` with actions `(N, 7)`: six absolute joint angles in degrees and how far the gripper closes (0 fully open at `gripper_max_mm()`, 1 at 0 mm, values between partly closed). `policy_link.py` passes the action space to the motion worker; a reply without it is `ee_delta`.
 
 `apply_joint_actions()` sends MOVE J (`0x151` byte 1 = `0x01`) and joints on `0x155` (J1, J2), `0x156` (J3, J4), `0x157` (J5, J6), big-endian int32 in 0.001 degrees, at 0.05 s per step, speed `joint_speed` (default 60%). Within each step `move_joints(start_deg=...)` interpolates from the previous target and resends about every 5–7 ms (about 140 Hz). MOVE J plans to each new target, so holding one target per 0.05 s step made J1 and J2 start and stop on every step; at 30% the arm also lagged the commanded rate. Before anything is sent, `check_joint_chunk()` refuses a step that moves any joint more than 3 degrees, or a chunk that moves a joint more than `max_chunk_joint_deg` (default 100) from the start. `move_joints()` refuses targets more than 2 degrees outside `JOINT_LIMITS_DEG` and clamps smaller excursions. The observation carries `observation/joints_deg` for scripted servers.
 
@@ -181,11 +231,11 @@ In low-speed feedback `0x261`–`0x266`, the driver-enabled flag is bit 6 of byt
 
 Replay uses the drag-teach episodes from `episode_recorder.py` (see `数据采集.md`). `episode_arrays()` reads `j1_deg`–`j6_deg`, `gripper_mm`, and `t_robot` from `robot_feedback.parquet`, or the same arrays from an `.npz`. `setup-remote` writes that `.npz` with `write_replay_npz()` and uploads it as `episodes/<episode folder>.npz`, so the server venv needs no pandas. The recorder runs on Windows and macOS: `open_policy_camera()` picks the Astra Pro with DirectShow or AVFoundation, and `KeyReader` reads `s`/`f`/`d` through `msvcrt` or a cbreak terminal (restored on exit; macOS then sets `PENDIN`, which is harmless).
 
-`simple_policy_server.py --mode replay --episode FILE` resamples onto 0.05 s steps with `np.interp`, marks the gripper closed at or below `dataset_export.GRIPPER_CLOSE_MM` (28 mm), and splits any step above 2.4 degrees. Each reply is the next `--chunk` steps (default 50). When the arm is more than 2.4 degrees from the chunk's first row (first chunk, loop restart, or lag), a half-speed `keyframe_chunk()` bridge is prepended. At the end the reply is `{"actions": (0, 7), "done": True}` and `policy_link.py` prints `server_done` and returns; `--loop` restarts instead. Each connection replays from the start.
+`simple_policy_server.py --mode replay --episode FILE` resamples onto 0.05 s steps with `np.interp`, marks the gripper closed (fully, to 0 mm) once it has closed by `GRIPPER_CLOSED_FRACTION` (30%) of the widest opening in the recording, else fully open (a grasp stops on the object, about 20 mm on a pen, so the old fixed 5 mm threshold never closed it on replay), clamps targets to `JOINT_LIMITS_DEG` (a hand can drag J5 past 70 degrees; it prints `clamped N steps`), and splits any step above 2.4 degrees. Each reply is the next `--chunk` steps (default 50). When the arm is more than 2.4 degrees from the chunk's first row (first chunk, loop restart, or lag), a half-speed `keyframe_chunk()` bridge is prepended. At the end the reply is `{"actions": (0, 7), "done": True}` and `policy_link.py` prints `server_done` and returns; `--loop` restarts instead. Each connection replays from the start. `policy_link.py replay [EPISODE]` does the same without a server (the camera only feeds a preview window; `_with_camera_window()` runs the replay in a thread because macOS draws windows only from the main thread): `replay_episode()` goes to `READY_DEG`, then feeds `Replay.next_chunk()` to the motion worker until it returns nothing, then goes back to `READY_DEG`. `episode_recorder.py` moves to `READY_DEG` before each take (in a motion worker that exits before the recorder opens the adapter), so replays start where the take started.
 
 `team_config.py` takes `--server simple|replay|openpi` over `server_mode`, then applies `mode_overrides[mode]` (any keys, typically Slurm partition, memory, time). `replay` copies `replay_episode` to `remote_code_dir/episodes/` in `setup-remote`. `openpi` runs `openpi_python` (default `.venv/bin/python` in `openpi_dir`) on a GPU; `openpi_dir`, `openpi_python`, and `checkpoint_dir` may start with `~/`. The job carries `--comment=MODE`; `up` refuses to reuse a `serve-policy` job from another mode. When the job's address differs from the one saved in `piper_link_state.json`, `up` closes the old local forward and opens a new one.
 
-`apply_actions()` keeps the first `execute_steps` rows (empty: all) and passes `ee_delta_scale` (empty: 1.0) to `action_waypoints()`, which multiplies translation and rotation. Limit checks raise `ChunkRefused`; `policy_step.py apply` then exits with status 3 and `policy_link.py` prints `chunk_refused` and observes again instead of stopping. The RoboCasa pi0.5 checkpoint answers in about 0.15 s after a first call of about 30 s; its unscaled chunks integrate to 0.3–1.5 m.
+`apply_actions()` keeps the first `execute_steps` rows (empty: all) and passes `ee_delta_scale` (empty: 1.0) to `action_waypoints()`, which multiplies translation and rotation. Limit checks raise `ChunkRefused`; the worker prints `chunk_refused`, replies `refused`, and `policy_link.py` and observes again instead of stopping. The RoboCasa pi0.5 checkpoint answers in about 0.15 s after a first call of about 30 s; its unscaled chunks integrate to 0.3–1.5 m.
 
 `policy_link.py home` uses the same `go_to()` path to fold to `HOME_DEG` (all zeros, the rest pose). `policy_link.py ready` and `once --ready` unfold to `READY_DEG` with joint targets before an `ee_delta` model, since end-pose targets from the folded pose are rejected.
 
@@ -241,8 +291,8 @@ The gripper command `0x159` is 8 bytes, big-endian: int32 stroke (0.001 mm), uin
 | Entry point | Result |
 | --- | --- |
 | `C_PiperInterface_V2("can0")` | Linux socketcan only |
-| `python-can` `gs_usb` / libusb | Access denied for this WinUSB device |
-| `pyAgxArm` + `agx_cando` | Documented Windows route; not installed or verified on this machine |
+| `python-can`'s own `gs_usb` | Access denied for this WinUSB device on Windows; stalls on macOS without a drain thread |
+| `pyAgxArm` + `agx_cando` | Documented Windows route; not tested with this adapter. `piper_can_bus.py` provides `piper_usb` instead |
 | `piper_ros` | Linux `can0` |
 | The ArmRobot UI, or the `QTcpSocket` inside it | Listens on no external port and owns the adapter |
 

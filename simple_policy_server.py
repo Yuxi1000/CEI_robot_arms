@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import websockets.sync.server
 
+from piper_client import JOINT_LIMITS_DEG
 from policy_link import packb, unpackb
 
 CHUNK_STEPS = 50
@@ -99,8 +100,9 @@ def demo_chunk(cycle, joints):
 
 # Same step length as policy_step.STEP_SECONDS; this file runs on the server without policy_step.
 STEP_SECONDS = 0.05
-# Gripper openings at or below this count as closed. Same value as dataset_export.GRIPPER_CLOSE_MM.
-CLOSE_BELOW_MM = 28.0
+# Replay closes the gripper fully once the recording has closed it by this fraction of its widest opening.
+# A grasp stops on the object (about 20 mm on a pen out of 100 mm), so a fixed few-mm threshold never fires.
+GRIPPER_CLOSED_FRACTION = 0.3
 
 
 def episode_arrays(path):
@@ -128,7 +130,7 @@ def write_replay_npz(episode_dir, destination):
     np.savez(destination, joints_deg=joints.astype(np.float32), gripper_mm=gripper.astype(np.float32), t=stamps.astype(np.float32))
 
 
-def episode_rows(path, close_below_mm=CLOSE_BELOW_MM):
+def episode_rows(path):
     """Resample a recording onto 0.05 s steps. Returns (N, 7) joint targets plus gripper.
 
     Steps that move a joint more than PEAK_STEP_DEG (the hand moved faster than
@@ -137,7 +139,16 @@ def episode_rows(path, close_below_mm=CLOSE_BELOW_MM):
     joints, gripper, stamps = episode_arrays(path)
     grid = np.arange(stamps[0], stamps[-1] + 1e-9, STEP_SECONDS)
     resampled = np.stack([np.interp(grid, stamps, joints[:, i]) for i in range(6)], axis=1)
-    closed = (np.interp(grid, stamps, gripper) < close_below_mm).astype(float)
+    # A hand can drag a joint past the commandable range; replay holds it at the limit instead.
+    limits = np.asarray(JOINT_LIMITS_DEG)
+    outside = (resampled < limits[:, 0]) | (resampled > limits[:, 1])
+    if outside.any():
+        joints_out = ", ".join(f"J{i + 1}" for i in np.flatnonzero(outside.any(axis=0)))
+        print(f"clamped {int(outside.any(axis=1).sum())} steps to joint limits ({joints_out})", flush=True)
+        resampled = np.clip(resampled, limits[:, 0], limits[:, 1])
+    # Column 6 is 1 (close to 0 mm) or 0 (open fully), never in between.
+    widest = max(float(np.max(gripper)), 1.0)
+    closed = (np.interp(grid, stamps, gripper) <= widest * (1.0 - GRIPPER_CLOSED_FRACTION)).astype(float)
     rows = [np.concatenate([resampled[0], [closed[0]]])]
     for index in range(1, len(grid)):
         previous = rows[-1][:6]
