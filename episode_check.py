@@ -7,6 +7,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
+from dataset_export import demonstrating
+
 
 def check_episode(episode_dir):
     episode = Path(episode_dir)
@@ -37,9 +39,10 @@ def check_episode(episode_dir):
         print("robot timestamps are not monotonic", flush=True)
     robot_dt = np.diff(robot_times)
     image_dt = np.diff(images["t_image"].to_numpy()) if len(images) > 1 else np.array([])
-    teaching = (
-        (feedback["teach_status"] == 1) & (feedback["ctrl_mode_name"] == "TEACHING")
-    ).mean()
+    collection_mode = metadata.get("collection_mode", "drag")
+    teaching = np.mean(
+        [demonstrating(collection_mode, row.ctrl_mode_name, row.teach_status) for row in feedback.itertuples()]
+    )
     print(
         f"feedback={len(feedback)} median_dt_s={np.median(robot_dt) if len(robot_dt) else 0:.3f} "
         f"image_median_dt_s={np.median(image_dt) if len(image_dt) else 0:.3f}",
@@ -53,7 +56,8 @@ def check_episode(episode_dir):
         f"gripper_mm:{feedback['gripper_mm'].min():.1f}..{feedback['gripper_mm'].max():.1f}",
         flush=True,
     )
-    print(f"teaching_fraction={teaching:.2f}", flush=True)
+    # Drag: share of samples in TEACHING. Leader/follower: share in a following mode (dataset_export.FOLLOWING_MODES).
+    print(f"teaching_fraction={teaching:.2f} collection_mode={collection_mode}", flush=True)
     changes = feedback.loc[
         feedback["ctrl_mode_name"].ne(feedback["ctrl_mode_name"].shift()),
         ["t_robot", "ctrl_mode_name", "teach_status"],

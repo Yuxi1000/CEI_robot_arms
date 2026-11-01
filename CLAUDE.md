@@ -24,6 +24,7 @@ python team_config.py job|serve # 仅打印手动启动服务器的命令
 python team_config.py setup-remote  # server_mode=simple：把测试服务器拷到 remote_code_dir 并建 venv
 python simple_policy_server.py --port 8000 [--mode demo|nudge|replay --episode F]  # 脚本化测试策略，默认关节 demo
 python episode_recorder.py --task "..."  # 先自动移到 READY_DEG，再拖动示教录制（相机+反馈，实时预览窗口），s/f/d 结束；--no-ready/--no-preview
+python collect.py --leader --task "..."  # 主从遥操作录制：从臂跟随同一总线上的主臂，不动臂，另存 lead_* 列
 python policy_link.py replay [episodes/episode_...] [--loop]  # --loop 一直重复直到 Ctrl+C； 本机回放一条（默认最新），前后都到 READY_DEG，不需要服务器，相机只做预览窗口（会动臂）
 python episode_check.py episodes/episode_...   # 时间线和曲线检查
 python dataset_export.py episodes/episode_...  # 成功的 episode 导出 0.05 s 网格的 12 维动作和 mask；--self-check 不连臂
@@ -56,7 +57,7 @@ python check_candidate_repo.py PATH_TO_REPO   # 换模型前检查候选策略�
 - 从折叠休息位姿发末端位姿目标会被机械臂逆解拒绝（`TARGET_EXCEEDS_LIMIT`，只有夹爪动）。服务器回复可带 `"action_space": "joints"`，动作为 `(N, 7)` 绝对关节角加夹爪闭合程度（0 张开、1 合到 0 mm，中间值部分闭合；回放只发 0/1：录制里合上超过最大开度 30% 记为合上），由 `apply_joint_actions()` 用 MOVE J（`0x155`–`0x157`）执行；每步内部按 `--freq`（默认 100 Hz）插值更新目标（只按 20 Hz 换目标会让 J1/J2 一卡一卡），速度取 `--speed` 或 `joint_speed`；`check_joint_chunk()` 限制每步不超过 3 度。`simple_policy_server.py` 默认 `--mode demo` 就走这条路。
 - `server_mode` 有 `simple`/`replay`/`openpi` 三种，`--server` 临时覆盖，`mode_overrides[mode]` 覆盖 Slurm 等键。任务带 `--comment=MODE`，换模式前要 `down`。本仓库 16 维 state / `(50, 12)` 动作契约来自 RoboCasa pi0.5（openpi 配置 `pi05_pretrain_human300`）；`openpi_python` 可指向装好它的 conda 环境。回放服务器回复 `"done": True` 时客户端正常退出。
 - 回放服务器把录制里超出 `JOINT_LIMITS_DEG` 的关节角截到限位（手能把 J5 拖过 70°）。录制前和回放前都先到 `READY_DEG`，保证起点一致。
-- 训练数据：`episode_recorder.py` 只读录制（相机 `open_policy_camera()` + `read_state()`，`KeyReader` 跨平台读键），格式和导出规则见 `数据采集.md`。回放服务器直接读这种 episode 文件夹（`episode_arrays()`），`setup-remote` 转成 `.npz` 上传。
+- 训练数据：`episode_recorder.py` 只读录制（相机 `open_policy_camera()` + `read_state()`，`KeyReader` 跨平台读键），格式和导出规则见 `数据采集.md`。`--leader` 录主从遥操作（`collection_mode: leader_follower`）：`leader_command()` 读主臂广播的 `0x155`–`0x157`/`0x159` 存进 `lead_*` 列（不导出，标签仍来自从臂实测位姿）；`dataset_export.demonstrating()` 按模式判断示教样本，主从用 `FOLLOWING_MODES`（实测从臂跟随时是 `CAN_CTRL`）。主臂在线时两台臂的固件回复会交错，要设 `PIPER_FIRMWARE=v189` 跳过自动识别。回放服务器直接读这种 episode 文件夹（`episode_arrays()`），`setup-remote` 转成 `.npz` 上传。
 - `policy_step.check_limits()` 在发送任何帧前检查 `max_chunk_shift_mm`（离 chunk 起点的最大距离）和 `workspace_mm`（基座系绝对盒子），超限抛 `ChunkRefused`（运动进程回复 `refused`），`policy_link.py` 打印 `chunk_refused` 跳过这个 chunk 继续观测。不要绕过它。`execute_steps`/`ee_delta_scale` 只执行 chunk 前 N 步并缩放（仿真模型的整段 chunk 积分是米级）。
 
 ## 模型相关的契约（换模型时首先要改的地方）

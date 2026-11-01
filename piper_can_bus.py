@@ -541,11 +541,14 @@ def create_piper_arm(firmware="auto", **config):
             create_agx_arm_config(robot=ArmModel.PIPER, firmeware_version=profile, **config)
         )
 
+    # PIPER_FIRMWARE (default, v183, v188, v189) skips the query.
+    firmware = os.environ.get("PIPER_FIRMWARE", firmware)
     if firmware != "auto":
         return build(firmware)
     probe = build("default")
     probe.connect()
     info = None
+    profile = None
     try:
         # get_firmware() discards the reply until the feedback rate is measured, which takes a moment after connect.
         deadline = time.time() + 2.0
@@ -554,12 +557,24 @@ def create_piper_arm(firmware="auto", **config):
         if probe.get_fps() <= 0:
             # With nothing else on the bus, writes are never acknowledged and time out on USB.
             raise RuntimeError("no CAN frames from the arm: check that it is powered on and its CAN cable reaches this adapter")
-        for _ in range(3):
+        for _ in range(5):
             info = probe.get_firmware(timeout=1.5)
-            if info:
+            if not info:
+                continue
+            try:
+                profile = resolve_firmware_profile(ArmModel.PIPER, info["software_version"])
                 break
+            except ValueError:
+                # Master/slave: both arms answer the query and their multi-frame replies interleave.
+                # Drop the mixed reply so the next query starts clean.
+                probe._parser.firmware_info.msg.clear()
     finally:
         probe.disconnect()
     if not info:
         raise RuntimeError("the arm did not report its firmware version: is it powered and on the bus?")
-    return build(resolve_firmware_profile(ArmModel.PIPER, info["software_version"]))
+    if profile is None:
+        raise RuntimeError(
+            f"unreadable firmware version {info['software_version']!r}: with a leader arm on the bus both arms answer; "
+            "set PIPER_FIRMWARE to the follower's profile (v189 for S-V1.9-0)"
+        )
+    return build(profile)

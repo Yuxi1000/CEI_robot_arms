@@ -1,4 +1,4 @@
-"""Record one drag-teach episode. The recording only reads the arm and the camera.
+"""Record one drag-teach or master/slave teleoperation episode. The recording only reads the arm and the camera.
 
 First the arm moves itself to the ready pose (READY_DEG) in a separate motion
 process, so every take starts where `policy_link.py once --ready` starts a
@@ -7,6 +7,9 @@ Recording sends no end-pose, joint, or gripper commands. Finish with a key:
 s = success, f = failure, d = discard. Ctrl+C stores the episode as interrupted.
 A preview window shows the camera live (the saved frames stay unmarked); the
 keys work in the terminal or in that window.
+With --leader the arm is the follower of a master (leader) arm on the same
+CAN bus: nothing is moved before recording (a joint command would fight the
+leader's), and the leader's broadcast commands are kept in lead_* columns.
 Runs on Windows (DirectShow, msvcrt) and macOS (AVFoundation, terminal in
 cbreak mode so a single key is read without Enter).
 """
@@ -71,7 +74,7 @@ def _append_event(path, origin, name):
         handle.write(json.dumps(event) + "\n")
 
 
-def _feedback_row(state, t_robot):
+def _feedback_row(state, t_robot, leader=None):
     pose = state["pose_mm_deg"]
     status = state["status"]
     row = {
@@ -92,6 +95,12 @@ def _feedback_row(state, t_robot):
     }
     for index, angle in enumerate(state["joints_deg"]):
         row[f"j{index + 1}_deg"] = float(angle)
+    if leader is not None:
+        # Kept for later use; the exported labels still come from this (follower) arm's measured pose.
+        command = leader if leader is not False else {"joints_deg": [None] * 6, "gripper_mm": None}
+        for index, angle in enumerate(command["joints_deg"]):
+            row[f"lead_j{index + 1}_deg"] = float("nan") if angle is None else float(angle)
+        row["lead_gripper_mm"] = float("nan") if command["gripper_mm"] is None else float(command["gripper_mm"])
     return row
 
 
@@ -108,8 +117,13 @@ def _show_preview(frame, elapsed, frames):
     return chr(code).lower() if code != 0xFF else None
 
 
-def record_episode(task, out_dir, seconds=None, preview=True):
-    print("keys: s success, f failure, d discard. Drag the arm; this program only reads.", flush=True)
+def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
+    """Record one episode. leader=True records master/slave teleoperation: this arm is the follower and the
+    leader's broadcast commands are stored in lead_* columns. Either way this program only reads the bus."""
+    if leader:
+        print("keys: s success, f failure, d discard. Move the leader arm; this program only reads.", flush=True)
+    else:
+        print("keys: s success, f failure, d discard. Drag the arm; this program only reads.", flush=True)
     if preview and not has_display():
         print("preview off: no display (over SSH, for example)", flush=True)
         preview = False
@@ -135,7 +149,7 @@ def record_episode(task, out_dir, seconds=None, preview=True):
     metadata = {
         "episode_id": episode_id,
         "task_text": task,
-        "collection_mode": "drag",
+        "collection_mode": "leader_follower" if leader else "drag",
         "action_source": "measured_trajectory",
         "success": None,
         "termination_reason": None,
@@ -153,6 +167,8 @@ def record_episode(task, out_dir, seconds=None, preview=True):
         "camera_read_failures": 0,
         "camera_gaps": 0,
     }
+    if leader:
+        metadata["leader_missing"] = 0
     _write_metadata(episode / "metadata.json", metadata)
     _append_event(events, origin, "start")
     print(f"episode={episode}", flush=True)
@@ -190,8 +206,14 @@ def record_episode(task, out_dir, seconds=None, preview=True):
                     metadata["camera_read_failures"] += 1
                 state = robot.read_state(timeout=0.05)
                 t_robot = _clock(origin)
+                command = None
+                if leader:
+                    command = robot.leader_command()
+                    if command is None:
+                        metadata["leader_missing"] += 1
+                        command = False
                 if state["complete"]:
-                    feedback.append(_feedback_row(state, t_robot))
+                    feedback.append(_feedback_row(state, t_robot, command))
                 else:
                     metadata["incomplete_reads"] += 1
                 if seconds is not None and _clock(origin) >= seconds:
@@ -246,14 +268,17 @@ def main():
     parser.add_argument("--seconds", type=float)
     parser.add_argument("--no-preview", action="store_true", help="record without the live camera window")
     parser.add_argument("--no-ready", action="store_true", help="record from wherever the arm is, without moving to the ready pose first")
+    parser.add_argument("--leader", action="store_true", help="master/slave teleoperation: this arm follows a leader arm on the same bus")
     args = parser.parse_args()
-    if not args.no_ready:
+    if args.leader:
+        input("power on the follower, then the leader; move the leader to the start pose, then press Enter to start recording")
+    elif not args.no_ready:
         from policy_link import go_ready
 
         # Runs in its own motion process, which has released the adapter before the recording opens it.
         go_ready()
         input("turn on drag teach, then press Enter to start recording")
-    record_episode(args.task, args.out, args.seconds, preview=not args.no_preview)
+    record_episode(args.task, args.out, args.seconds, preview=not args.no_preview, leader=args.leader)
 
 
 if __name__ == "__main__":

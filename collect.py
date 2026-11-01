@@ -4,6 +4,9 @@ Turn on drag-teach first, then run this in this folder:
 
     python collect.py --task "put the pen in the box"
 
+For master/slave teleoperation (this arm follows a leader arm on the same
+CAN bus), power on the follower, then the leader, and add --leader.
+
 Press s, f, or d in the same window when the attempt ends. Only s is exported.
 A successful export also rebuilds datasets/piper_finetune from every successful
 episode in this folder. To do that for the newest episode already on disk:
@@ -45,6 +48,7 @@ def main():
     parser.add_argument("--latest", action="store_true", help="check and export the newest episode")
     parser.add_argument("--out", default="episodes")
     parser.add_argument("--seconds", type=float, help="stop after this many seconds; success stays unset")
+    parser.add_argument("--leader", action="store_true", help="master/slave teleoperation instead of drag-teach")
     args = parser.parse_args()
     if args.task and args.latest:
         raise SystemExit("pass either --task or --latest")
@@ -55,7 +59,7 @@ def main():
         return
     from episode_recorder import record_episode
 
-    finish_episode(record_episode(args.task, args.out, args.seconds), args.out)
+    finish_episode(record_episode(args.task, args.out, args.seconds, leader=args.leader), args.out)
 
 
 if __name__ == "__main__":

@@ -94,7 +94,7 @@ Without a folder it plays the newest recording. No server is needed. A window sh
 
 ## Record a demonstration
 
-This stores a person dragging the arm. First the program moves the arm to the ready pose, so every recording (and its replay) starts from the same place; add `--no-ready` to skip that. Then it asks you to turn on drag-teach and press Enter. While recording it only reads the arm and the camera, and a window shows the camera live (`--no-preview` hides it; over SSH there is no window). Run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
+This stores a person dragging the arm (recording with a leader arm is at the end of this section). First the program moves the arm to the ready pose, so every recording (and its replay) starts from the same place; add `--no-ready` to skip that. Then it asks you to turn on drag-teach and press Enter. While recording it only reads the arm and the camera, and a window shows the camera live (`--no-preview` hides it; over SSH there is no window). Run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
 
 ```powershell
 python collect.py --task "put the pen in the box"
@@ -115,6 +115,18 @@ To check and export the newest episode already on disk:
 ```powershell
 python collect.py --latest
 ```
+
+### Record with a leader arm
+
+The leader arm and this (follower) arm share one CAN bus and one adapter. Both grippers must be ID10, and the leader/follower roles must already be set in the host software. Power on the follower first, then the leader, then run:
+
+```powershell
+python collect.py --leader --task "put the pen in the box"
+```
+
+With the leader on the bus, both arms answer the firmware-version query and the replies interleave, so the program stops with `unreadable firmware version`. Then name the follower's firmware profile before the command: on a Mac or Linux `PIPER_FIRMWARE=v189 .venv/bin/python collect.py --leader ...`, in Windows PowerShell first `$env:PIPER_FIRMWARE="v189"`. `v189` covers S-V1.8-9 and later (this follower runs S-V1.9-0); see `DEVELOPER_GUIDE.md` for the others.
+
+The program does not move the arm in this mode. Use the leader to bring the follower to the start pose, press Enter to start recording, and finish with the same keys as above. Recording only reads the bus and the camera. The leader's commands are stored as well, but the training labels still come from the follower's measured pose. `teaching_fraction` is now the share of time the follower is in a following mode and should be close to 1; if it is 0, send that episode's `mode_changes` to whoever maintains the code. Before inference, unplug the leader (its commands would fight the policy's), set the former leader back to follower mode, and power-cycle it.
 
 ## Run once
 

@@ -154,6 +154,27 @@ class PiperClient:
         state["complete"] = all(state[key] is not None for key in ("joints_deg", "gripper_mm", "pose_mm_deg", "status"))
         return state
 
+    def leader_command(self):
+        """The leader arm's latest command in master/slave teleoperation, or None.
+
+        Only reads what the leader broadcasts on the shared bus: joint targets
+        0x155-0x157 and gripper 0x159. Returns None until all three joint
+        frames are fresh. gripper_mm is None without a fresh 0x159.
+        """
+        # pyAgxArm's get_leader_joint_angles() fills joints whose frame never arrived with 0;
+        # check each frame's age so a missing one is not recorded as 0 degrees.
+        parser = self._arm._parser
+        parts = [getattr(parser, name, None) for name in ("leader_joint_12", "leader_joint_34", "leader_joint_56")]
+        if any(part is None or time.time() - part.timestamp >= STALE_S for part in parts):
+            return None
+        joints = self._arm.get_leader_joint_angles().msg
+        gripper = self._gripper.get_gripper_ctrl_states()
+        fresh = gripper is not None and time.time() - gripper.timestamp < STALE_S
+        return {
+            "joints_deg": [math.degrees(value) for value in joints],
+            "gripper_mm": gripper.msg.value * 1000 if fresh else None,
+        }
+
     def driver_faults(self, timeout=0.3):
         """Joint driver faults from low-speed feedback 0x261-0x266, as {joint: [names]}; empty when all are fine.
 
