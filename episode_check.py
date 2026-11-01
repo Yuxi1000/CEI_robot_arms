@@ -7,7 +7,14 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from dataset_export import demonstrating
+from dataset_export import (
+    MIN_PATH_MM,
+    MIN_ROTATION_DEG,
+    demonstrating,
+    euler_to_matrix,
+    follower_motion,
+    leader_missing_share,
+)
 
 
 def check_episode(episode_dir):
@@ -23,14 +30,20 @@ def check_episode(episode_dir):
         flush=True,
     )
     print(f"events={events}", flush=True)
-    readable = 0
-    missing_files = 0
-    for _, row in images.iterrows():
-        if (episode / row["file"]).is_file():
-            readable += 1
-        else:
-            missing_files += 1
-    print(f"frames_listed={len(images)} frames_readable={readable} frames_missing={missing_files}", flush=True)
+    def count_files(column):
+        if column not in images.columns:
+            return 0, 0
+        listed = int(images[column].notna().sum())
+        readable = sum(1 for value in images[column] if pd.notna(value) and (episode / str(value)).is_file())
+        return readable, listed - readable
+
+    readable, missing_files = count_files("file")
+    wrist_readable, wrist_missing = count_files("wrist_file")
+    print(
+        f"frames_listed={len(images)} third_view={readable} wrist={wrist_readable} "
+        f"frames_missing={missing_files + wrist_missing}",
+        flush=True,
+    )
     if feedback.empty:
         print("empty arm feedback", flush=True)
         return
@@ -58,6 +71,29 @@ def check_episode(episode_dir):
     )
     # Drag: share of samples in TEACHING. Leader/follower: share in a following mode (dataset_export.FOLLOWING_MODES).
     print(f"teaching_fraction={teaching:.2f} collection_mode={collection_mode}", flush=True)
+    # The export is refused on this number, not on any leader data: a follower that
+    # was never commanded stands still, which is exactly what these stats catch.
+    poses = [
+        {
+            "x_mm": row.x_mm,
+            "y_mm": row.y_mm,
+            "z_mm": row.z_mm,
+            "gripper_mm": row.gripper_mm,
+        }
+        for row in feedback.itertuples()
+    ]
+    rotations = [euler_to_matrix(row.rx_deg, row.ry_deg, row.rz_deg) for row in feedback.itertuples()]
+    motion = follower_motion(poses, rotations)
+    print(
+        f"follower_path_mm={motion['path_mm']:.1f} span_mm={motion['span_mm']:.1f} "
+        f"path_deg={motion['path_deg']:.1f} gripper_travel_mm={motion['gripper_travel_mm']:.1f}",
+        flush=True,
+    )
+    if motion["path_mm"] < MIN_PATH_MM and motion["path_deg"] < MIN_ROTATION_DEG:
+        print("the arm never moved in this take; export will refuse it", flush=True)
+    if collection_mode == "leader_follower":
+        # Diagnostic only: the leader columns never decide whether a take exports.
+        print(f"leader_missing_share={leader_missing_share(metadata, feedback):.2f} (diagnostic only)", flush=True)
     changes = feedback.loc[
         feedback["ctrl_mode_name"].ne(feedback["ctrl_mode_name"].shift()),
         ["t_robot", "ctrl_mode_name", "teach_status"],
@@ -102,17 +138,31 @@ def _save_plot(episode, feedback, images):
         print("wrote " + ", ".join(wrote), flush=True)
         return
     picks = images.iloc[np.linspace(0, len(images) - 1, num=min(4, len(images)), dtype=int)]
-    frames = []
-    for _, row in picks.iterrows():
-        path = episode / row["file"]
-        if not path.is_file():
+    rows = []
+    # One strip per camera, third view on top and wrist below.
+    for column in ("file", "wrist_file"):
+        if column not in images.columns:
             continue
-        frame = cv2.imread(str(path))
-        if frame is None:
-            continue
-        frames.append(cv2.resize(frame, (320, 240)))
-    if frames:
-        cv2.imwrite(str(episode / "check_frames.jpg"), np.hstack(frames))
+        frames = []
+        for _, row in picks.iterrows():
+            if pd.isna(row[column]):
+                continue
+            path = episode / str(row[column])
+            if not path.is_file():
+                continue
+            frame = cv2.imread(str(path))
+            if frame is None:
+                continue
+            frames.append(cv2.resize(frame, (320, 240)))
+        if frames:
+            rows.append(np.hstack(frames))
+    if rows:
+        width = max(row.shape[1] for row in rows)
+        padded = [
+            cv2.copyMakeBorder(row, 0, 0, 0, width - row.shape[1], cv2.BORDER_CONSTANT, value=(255, 255, 255))
+            for row in rows
+        ]
+        cv2.imwrite(str(episode / "check_frames.jpg"), np.vstack(padded))
         wrote.append(str(episode / "check_frames.jpg"))
     print("wrote " + ", ".join(wrote), flush=True)
 

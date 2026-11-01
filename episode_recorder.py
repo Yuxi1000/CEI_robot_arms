@@ -1,22 +1,27 @@
-"""Record one drag-teach or master/slave teleoperation episode. The recording only reads the arm and the camera.
+"""Record one drag-teach or master/slave teleoperation episode. The recording only reads the arm and the two cameras.
 
-First the arm moves itself to the ready pose (READY_DEG) in a separate motion
-process, so every take starts where `policy_link.py once --ready` starts a
-replay; --no-ready skips that move. Then turn on drag teach and press Enter.
-Recording sends no end-pose, joint, or gripper commands. Finish with a key:
-s = success, f = failure, d = discard. Ctrl+C stores the episode as interrupted.
-A preview window shows the camera live (the saved frames stay unmarked); the
-keys work in the terminal or in that window.
+Frames from both D405 cameras are saved per control step: the third view in
+``images/`` and the wrist view in ``images_wrist/``, with the same index and one
+timestamp row per pair. First the arm moves itself to the ready pose (READY_DEG)
+in a separate motion process, so every take starts where
+`policy_link.py once --ready` starts a replay; --no-ready skips that move. Then
+turn on drag teach and press Enter. Recording sends no end-pose, joint, or
+gripper commands. Finish with a key: s = success, f = failure, d = discard.
+Ctrl+C stores the episode as interrupted. A preview window shows both cameras
+live side by side (the saved frames stay unmarked); the keys work in the terminal
+or in that window.
 With --leader the arm is the follower of a master (leader) arm on the same
 CAN bus: nothing is moved before recording (a joint command would fight the
 leader's), and the leader's broadcast commands are kept in lead_* columns.
-Runs on Windows (DirectShow, msvcrt) and macOS (AVFoundation, terminal in
-cbreak mode so a single key is read without Enter).
+Runs on Windows and macOS (the terminal is put in cbreak mode so a single key is
+read without Enter).
 """
 
 import argparse
 import json
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -24,10 +29,14 @@ import cv2
 import pandas as pd
 
 from piper_client import PiperClient
-from policy_link import has_display, open_policy_camera
+from policy_cameras import THIRD_VIEW, WRIST, PolicyCameras, side_by_side
+from policy_link import has_display
 
 SCHEMA_VERSION = 1
-CAMERA_ID = "vid_2bc5_pid_0501"
+# One frame pair per control step, so the images line up with the 0.05 s export grid.
+CAPTURE_DT_S = 0.05
+# A gap longer than this between saved frames is counted in metadata.json.
+GAP_S = 0.15
 PREVIEW_TITLE = "episode recorder (s success, f failure, d discard)"
 
 
@@ -66,6 +75,52 @@ class KeyReader:
 
 def _clock(origin):
     return time.perf_counter() - origin
+
+
+class _ImageWriter:
+    """Write both camera frames on a thread, so disk latency does not slow the recording loop.
+
+    A pair written to exFAT under episodes/ took about 30 ms, which alone drops the
+    loop below the 0.05 s capture step. A pair that cannot be queued counts as a
+    write failure, and a row is appended once the pair is queued: a late failure
+    therefore shows up in episode_check as a missing file, and prepare_dataset
+    skips a segment whose frames are not on disk.
+    """
+
+    def __init__(self, image_dir, wrist_dir, depth=20):
+        self._queue = queue.Queue(maxsize=depth)
+        self._image_dir = image_dir
+        self._wrist_dir = wrist_dir
+        self.failures = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, name, frames):
+        try:
+            self._queue.put_nowait((name, frames[THIRD_VIEW], frames[WRIST]))
+        except queue.Full:
+            self.failures += 1
+            return False
+        return True
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                name, third, wrist = item
+                third_ok = cv2.imwrite(str(self._image_dir / name), third)
+                wrist_ok = cv2.imwrite(str(self._wrist_dir / name), wrist)
+                if not (third_ok and wrist_ok):
+                    self.failures += 1
+            finally:
+                self._queue.task_done()
+
+    def finish(self):
+        """Wait for the queued frames to reach the disk."""
+        self._queue.put(None)
+        self._thread.join(timeout=120)
 
 
 def _append_event(path, origin, name):
@@ -108,10 +163,10 @@ def _write_metadata(path, payload):
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def _show_preview(frame, elapsed, frames):
-    """Show the frame with the elapsed time. Returns a lowercase key pressed in the window, or None."""
-    view = frame.copy()
-    cv2.putText(view, f"REC {elapsed:6.1f}s  frames {frames}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+def _show_preview(frames, elapsed, count):
+    """Show both cameras side by side with the elapsed time. Returns a lowercase key pressed in the window, or None."""
+    view = side_by_side(frames, (THIRD_VIEW, WRIST))
+    cv2.putText(view, f"REC {elapsed:6.1f}s  frames {count}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
     cv2.imshow(PREVIEW_TITLE, view)
     code = cv2.waitKey(1) & 0xFF
     return chr(code).lower() if code != 0xFF else None
@@ -127,23 +182,20 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
     if preview and not has_display():
         print("preview off: no display (over SSH, for example)", flush=True)
         preview = False
-    capture, camera_index = open_policy_camera()
-    if not capture.isOpened():
-        raise RuntimeError(f"could not open the Astra Pro color camera at index {camera_index}")
-    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cameras = PolicyCameras().__enter__()
     robot = PiperClient()
     try:
         robot.connect()
     except Exception:
-        capture.release()
+        cameras.__exit__(None, None, None)
         raise
 
     episode_id = time.strftime("episode_%Y%m%d_%H%M%S")
     episode = Path(out_dir) / episode_id
     image_dir = episode / "images"
+    wrist_dir = episode / "images_wrist"
     image_dir.mkdir(parents=True)
+    wrist_dir.mkdir(parents=True)
     origin = time.perf_counter()
     events = episode / "events.jsonl"
     metadata = {
@@ -154,8 +206,8 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
         "success": None,
         "termination_reason": None,
         "schema_version": SCHEMA_VERSION,
-        "physical_camera_count": 1,
-        "camera_id": CAMERA_ID,
+        "physical_camera_count": 2,
+        "cameras": {THIRD_VIEW: cameras.mapping[THIRD_VIEW], WRIST: cameras.mapping[WRIST]},
         "color_order": "bgr",
         "length_unit": "mm",
         "angle_unit": "deg",
@@ -180,30 +232,40 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
     error = None
     last_image_t = None
     window_key = None
+    writer = _ImageWriter(image_dir, wrist_dir)
     with KeyReader() as keys:
         try:
             while True:
-                grabbed = capture.grab()
-                t_image = _clock(origin)
-                ok, frame = capture.retrieve() if grabbed else (False, None)
-                if ok and frame is not None:
-                    if last_image_t is not None and t_image - last_image_t > 0.15:
+                cycle_start = time.perf_counter()
+                try:
+                    frames = cameras.read_bgr()
+                except RuntimeError:
+                    metadata["camera_read_failures"] += 1
+                    frames = None
+                if frames is not None:
+                    t_image = _clock(origin)
+                    if last_image_t is not None and t_image - last_image_t > GAP_S:
                         metadata["camera_gaps"] += 1
                     last_image_t = t_image
                     name = f"{len(images):06d}.jpg"
-                    if cv2.imwrite(str(image_dir / name), frame):
-                        images.append({"index": len(images), "t_image": t_image, "file": f"images/{name}"})
+                    if writer.submit(name, frames):
+                        images.append(
+                            {
+                                "index": len(images),
+                                "t_image": t_image,
+                                "file": f"images/{name}",
+                                "wrist_file": f"images_wrist/{name}",
+                            }
+                        )
                     else:
                         metadata["image_write_failures"] += 1
                     if preview:
                         try:
-                            window_key = _show_preview(frame, t_image, len(images))
+                            window_key = _show_preview(frames, t_image, len(images))
                         except cv2.error as exc:
                             # OpenCV built without a GUI (headless): keep recording without the window.
                             print(f"preview off: {exc}", flush=True)
                             preview = False
-                else:
-                    metadata["camera_read_failures"] += 1
                 state = robot.read_state(timeout=0.05)
                 t_robot = _clock(origin)
                 command = None
@@ -231,13 +293,19 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
                     if key == "d":
                         reason, success = "discard", None
                         break
+                # One capture per control step: the export grid is 0.05 s, so faster
+                # frames would only land on the same row as the one before.
+                remaining = CAPTURE_DT_S - (time.perf_counter() - cycle_start)
+                if remaining > 0:
+                    time.sleep(remaining)
         except KeyboardInterrupt:
             reason, success = "interrupted", None
         except Exception as exc:
             reason, success = "error", None
             error = exc
         finally:
-            capture.release()
+            cameras.close()
+            writer.finish()
             robot.close()
             if preview:
                 cv2.destroyAllWindows()
@@ -246,6 +314,10 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
     metadata["termination_reason"] = reason
     metadata["frames"] = len(images)
     metadata["feedback_samples"] = len(feedback)
+    metadata["image_write_failures"] += writer.failures
+    if len(images) > 1:
+        span = images[-1]["t_image"] - images[0]["t_image"]
+        metadata["image_fps"] = round((len(images) - 1) / span, 1) if span > 0 else 0.0
     if error is not None:
         metadata["error"] = str(error)
     _write_metadata(episode / "metadata.json", metadata)

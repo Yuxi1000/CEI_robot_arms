@@ -43,7 +43,8 @@ flowchart TB
 | --- | --- |
 | `piper_client.py` | `PiperClient`: a thin layer on the official `pyAgxArm` SDK in degrees and millimetres. `read_state()`, `driver_faults()`, gripper, leave teach, enable, MOVE J, MOVE P. See [piper_client.py](#piper_clientpy) |
 | `piper_can_bus.py` | Picks the CAN backend for this platform and the firmware profile, and drives the adapter over USB on Windows and macOS. See [Official SDK (pyAgxArm)](#official-sdk-pyagxarm) |
-| `policy_link.py` | Builds the observation, keeps one WebSocket open, and loops inference. The camera and CAN writes are not in the same process |
+| `policy_link.py` | Builds the observation, keeps one WebSocket open, and loops inference. The cameras and CAN writes are not in the same process |
+| `policy_cameras.py` | Both D405 streams, opened once per session and selected by serial from `team_config.json` |
 | `policy_step.py` | Integrates one action chunk into an end-effector trajectory in the base frame and writes it to CAN |
 | `team_config.json` | Login account, SSH alias, checkpoint, and log directory. Copy it from the tracked blank `team_config.example.json`; the real file is gitignored because the repository is public |
 | `team_config.py` | `run` submits the job, waits until it listens, opens one local forward, and starts continuous control. `once` starts another round while the forward is up. `down` cancels the job and closes the forward. `job` and `serve` still only print commands |
@@ -123,7 +124,7 @@ Status names (`TEACHING`, `CAN_CTRL`, ...) come from the tables in `piper_client
 
 While `0x2A1` control mode is `0x02` (`TEACHING`) and the teach byte is `0x01`, end-pose commands are not followed. Bit 6 of byte 6 in low-speed feedback `0x261`–`0x266` means that joint driver is enabled.
 
-Putting the camera and CAN writes in one process exited with an access violation (`3221225477`) on Windows, so the arm lives in a separate process. `policy_link.MotionWorker` starts `policy_step.py worker` once per session; that process connects the arm once and answers state reads and chunks as pickled tuples on its stdin and stdout, printing to stderr. `policy_link.py` keeps only the camera, as a `LiveCamera` that stays open and whose thread keeps the newest frame. Before this, every cycle reopened the camera and reconnected the arm twice, with a firmware check each time, and held the last target for 0.5 s, which left a pause of 1–3 s between chunks; it is now tens of milliseconds plus inference.
+Putting the camera and CAN writes in one process exited with an access violation (`3221225477`) on Windows, so the arm lives in a separate process. `policy_link.MotionWorker` starts `policy_step.py worker` once per session; that process connects the arm once and answers state reads and chunks as pickled tuples on its stdin and stdout, printing to stderr. `policy_link.py` keeps only the cameras, as `PolicyCameras` (`policy_cameras.py`), whose per-camera reader threads cache the newest frame from each RealSense pipeline. Before this, every cycle reopened the camera and reconnected the arm twice, with a firmware check each time, and held the last target for 0.5 s, which left a pause of 1–3 s between chunks; it is now tens of milliseconds plus inference.
 
 ## Policy link
 
@@ -136,11 +137,13 @@ Order inside `once`:
 1. Retry the connection to `ws://host:port` up to 50 times, with a 2-second handshake timeout. `python team_config.py once` and `python policy_link.py once` without `--port` both use `local_forward_port`. `python policy_link.py serve` still listens on `127.0.0.1:8765` by default, which is the local placeholder server.
 2. Receive metadata within 30 seconds and print `server_connected`.
 3. Ask the motion worker for `read_state()`. If it is incomplete, raise and do not send.
-4. `LiveCamera.read_bgr()` returns the first frame captured after the call from the Orbbec Astra Pro color camera (USB `VID_2BC5` `PID_0501`), and `model_image()` turns it into RGB padded to 224×224. Other cameras on the same computer are not selected. `build_observation(state, image)` sends it as `observation/image`.
-5. Send the observation and print `image_mean` and `waiting_for_inference`.
+4. `PolicyCameras.read_bgr()` returns one frame from each D405 captured after the call: `third_view` and `wrist`, selected by serial from `team_config.json`. `model_image()` turns each into RGB padded to 224×224. `build_observation(state, image, wrist_image)` sends them as `observation/image` and `observation/wrist_image`.
+5. Send the observation and print a block that proves what went out: both shapes, dtypes and means, `third_vs_wrist_mad` (mean absolute difference between the two model inputs; under 1.0 means both slots carry the same picture, i.e. the camera roles are wrong), the decoded 16-d state (`xyz_mm`, `quat_xyzw`, the six static body dims, the gripper split into finger openings), and the prompt. Then print `waiting_for_inference`.
 6. Wait up to 600 seconds. If the reply is a string, raise it as a `RuntimeError`. That is how an OpenPI server returns an exception.
-7. Print `actions_shape`. One verified return was `(50, 12)`. Then the motion worker executes the whole chunk and prints `pose_sent` plus the state read right afterward (no settle wait).
+7. Print the chunk: shape, dtype, `action_space`, and for `ee_delta` the summed translation in millimetres, the summed rotation in degrees, the mean gripper value and the largest unused column. A wrong horizon or an all-zero chunk is called out as a `WARNING`, so a placeholder server is never mistaken for a policy. One verified return was `(50, 12)`. The motion worker then executes the whole chunk and prints `pose_sent` plus the state read right afterward (no settle wait).
 8. Return to step 3. `Ctrl+C` prints `stopped` and exits; the worker gets the same Ctrl+C and disconnects. The WebSocket, the camera, and the motion worker stay open for the whole loop. Only the worker opens the adapter.
+
+`--observe-only` runs steps 1–7 and then loops without step 7's execution, printing `observe_only: chunk not applied; the arm has not moved`. `--cycles N` stops after N observations instead of waiting for `Ctrl+C`. Together they are the check to run before a first real rollout: they prove both camera streams, the 16-d state and the prompt reach the server, that the server answers with a chunk of the right shape, and that nothing on the client side is moving the arm. Nothing about it trusts the checkpoint, so a very wrong chunk here still means the transport works.
 
 `python policy_link.py serve` is a local placeholder on `127.0.0.1:8765`. It only checks the observation shape currently in this code and returns a placeholder action. It is not a substitute for anyone's checkpoint.
 
@@ -152,12 +155,13 @@ The table below is what the current function sends. It is not everyone's input:
 
 | Key | Value |
 | --- | --- |
-| `observation/image` | uint8, `(224, 224, 3)`, Orbbec Astra Pro color frame, already RGB |
+| `observation/image` | uint8, `(224, 224, 3)`, third-view D405 frame, already RGB |
+| `observation/wrist_image` | uint8, `(224, 224, 3)`, wrist D405 frame, already RGB |
 | `observation/joints_deg` | float32, `(6,)`. Scripted servers command joints with it; model servers drop it |
 | `observation/state` | float32, shape `(16,)` |
 | `prompt` | the `PROMPT` constant, currently `put the pen into the box`. It must match `meta/tasks.jsonl` character for character |
 
-One image stream only. `pi05_piper_finetune` feeds it to `base_0_rgb` and sets `image_mask` false for both wrist slots, so do not copy this frame into `observation/wrist_image` or `observation/right_image`.
+Two image streams. `pi05_piper_finetune` feeds `observation/image` to `base_0_rgb` and `observation/wrist_image` to `left_wrist_0_rgb`, and sets `image_mask` false for `right_wrist_0_rgb` only. The scripted server rejects an observation without the wrist key, so a half-connected camera pair fails locally instead of on the GPU node.
 
 The order of these 16 numbers is written in `piper_train_state()`, bit-for-bit the same as `prepare_dataset.piper_train_state()` (a check script compared them and the difference was 0):
 
@@ -196,10 +200,17 @@ Setup on a Mac:
 ```bash
 brew install libusb
 python3 -m venv .venv
-.venv/bin/pip install numpy msgpack 'websockets>=13' opencv-python pyusb pyobjc-framework-AVFoundation pandas pyarrow python-can "git+https://github.com/agilexrobotics/pyAgxArm.git"
+.venv/bin/pip install numpy msgpack 'websockets>=13' opencv-python pyrealsense2 pyusb pandas pyarrow python-can "git+https://github.com/agilexrobotics/pyAgxArm.git"
 ```
 
-OpenCV on macOS numbers cameras in `uniqueID` order and cannot select one by USB ID. `_avfoundation_devices()` rebuilds that order through pyobjc, and the Astra Pro is the device whose model ID contains `VendorID_11205 ProductID_1281` (0x2BC5 / 0x0501). A non-empty `camera_index` in `team_config.json` overrides it. `python policy_link.py cameras` lists indexes with names. `python policy_link.py preview [--index N]` opens a live window with the 224×224 model input inset; q closes it. Camera access must be allowed for the app that runs the command.
+`policy_cameras.py` addresses both cameras by serial, because the two D405 units are the same model and an OpenCV index or a V4L2 node can point at the other one between runs. `install pyrealsense2` and set `third_view_serial` and `wrist_serial` in `team_config.json`; `camera_serials()` checks both against `rs.context().query_devices()` and refuses an unplugged or duplicated serial.
+
+**Depth does not name the cameras.** Two D405 units on one hub perturb each other's depth readings, and the median depends on where each unit happens to point, so an earlier build that picked the wrist by "smaller median depth" had the two views swapped. The role now comes from `team_config.json` only, and `python policy_link.py cameras` prints the depth profile as context, never as a verdict. To prove the assignment, use one of these two:
+
+- `python _realsense_test.py` writes `third_view.png`, `wrist.png` and `side_by_side.png` to `_camera_test/`, each labelled with its role and serial, with the 224×224 model input beside it. The third view is the fixed camera outside the arm; the wrist view is bolted to the arm.
+- `python policy_link.py cameras --motion-check` takes one still from each camera, asks you to move the arm and press Enter, and reports which frame changed. The camera that moved with the arm is the wrist view, and it warns when that disagrees with `team_config.json`. It commands nothing itself.
+
+If the two are the other way round, exchange `third_view_serial` and `wrist_serial`; nothing else reads the serials. `python policy_link.py preview` opens one window per camera, titled with role and serial, with the model input inset; q closes them. Camera access must be allowed for the app that runs the command.
 
 `policy_step.check_limits()` runs before any frame is sent. A waypoint farther than `max_chunk_shift_mm` (default 30) from the pose read before the chunk, or outside the absolute base-frame box `workspace_mm` (`{"x": [min, max], ...}`; an empty axis is skipped), raises and sends nothing.
 
@@ -207,10 +218,10 @@ OpenCV on macOS numbers cameras in `uniqueID` order and cannot select one by USB
 
 ## Linux and IQ9075
 
-Verified on a Qualcomm IQ9075 (aarch64 Yocto, Python 3.12) with the arm and the Astra Pro plugged in directly.
+Verified on a Qualcomm IQ9075 (aarch64 Yocto, Python 3.12) with the arm and the Astra Pro plugged in directly. That platform ran the older single-camera code; the current build expects two RealSense D405 cameras.
 
 - CAN: the Linux kernel's gs_usb driver owns the adapter as `can0`, and pyAgxArm uses python-can's `socketcan` backend on it. `bring_up_can()` brings `can0` up at 1 Mbps after a replug; that needs root.
-- Camera: `_v4l2_camera_index()` picks the `/dev/videoN` with USB IDs `2BC5:0501` and V4L2 index 0 (the capture node), opened with `CAP_V4L2`. A non-empty `camera_index` overrides it.
+- Camera: `pyrealsense2` is the only backend, and it is selected by serial, so Linux needs no V4L2 node mapping. Add both serials to `team_config.json` as above.
 - Python there has no pip, `ensurepip`, `venv` or `sqlite3`. Download `manylinux` aarch64 cp312 wheels on another machine (`pip download --only-binary=:all: --platform manylinux2014_aarch64 --python-version 3.12 ...`), unzip them into `.pylib` in the code directory, and run with `PYTHONPATH=.pylib`. See [Official SDK (pyAgxArm)](#official-sdk-pyagxarm) for the `sqlite3` stub.
 
 Driver faults: a joint driven into its mechanical stop trips overcurrent and disables that joint's driver; the controller then ignores every joint command while the gripper still works. `PiperClient.driver_faults()` reads byte 5 of `0x261`–`0x266`, and `policy_step.require_healthy_drivers()` refuses to send any motion frame while a fault is set. Power-cycle the arm to clear it.
@@ -229,9 +240,15 @@ In low-speed feedback `0x261`–`0x266`, the driver-enabled flag is bit 6 of byt
 
 ## Replay and server modes
 
-Replay uses the drag-teach episodes from `episode_recorder.py` (see `数据采集.md`). `episode_arrays()` reads `j1_deg`–`j6_deg`, `gripper_mm`, and `t_robot` from `robot_feedback.parquet`, or the same arrays from an `.npz`. `setup-remote` writes that `.npz` with `write_replay_npz()` and uploads it as `episodes/<episode folder>.npz`, so the server venv needs no pandas. The recorder runs on Windows and macOS: `open_policy_camera()` picks the Astra Pro with DirectShow or AVFoundation, and `KeyReader` reads `s`/`f`/`d` through `msvcrt` or a cbreak terminal (restored on exit; macOS then sets `PENDIN`, which is harmless).
+Replay uses the drag-teach episodes from `episode_recorder.py` (see `数据采集.md`). `episode_arrays()` reads `j1_deg`–`j6_deg`, `gripper_mm`, and `t_robot` from `robot_feedback.parquet`, or the same arrays from an `.npz`. `setup-remote` writes that `.npz` with `write_replay_npz()` and uploads it as `episodes/<episode folder>.npz`, so the server venv needs no pandas. The recorder runs on Windows and macOS: `PolicyCameras` opens both D405 pipelines for the whole take and `KeyReader` reads `s`/`f`/`d` through `msvcrt` or a cbreak terminal (restored on exit; macOS then sets `PENDIN`, which is harmless).
 
 `episode_recorder.py --leader` (and `collect.py --leader`) records master/slave teleoperation: this arm follows a leader arm on the same CAN bus and adapter. It skips the move to `READY_DEG` (a joint command would fight the leader's) and sends nothing. `PiperClient.leader_command()` reads the leader's broadcast joint command (`0x155`–`0x157`, through pyAgxArm's `get_leader_joint_angles()`, which fills missing frames with 0, so it checks the parser's `leader_joint_12/34/56` timestamps itself) and gripper command (`0x159`); anything older than 0.5 s is missing. Each feedback row gets `lead_j1_deg`–`lead_j6_deg` and `lead_gripper_mm` (NaN when missing, counted in `leader_missing`), and metadata has `collection_mode: leader_follower`. These columns are not exported: labels still come from the follower's measured pose. `dataset_export.demonstrating()` decides which samples count: `TEACHING` with teach=1 for `drag`, a control mode in `FOLLOWING_MODES` for `leader_follower` (only `CAN_CTRL`: measured on this arm, the follower's `0x2A1` stays `CAN_CTRL`, MOVE J, teach 0 while it tracks the leader); other samples get `not_teaching` or `not_following` and mask 0. `episode_check.py` prints the share as `teaching_fraction` and the modes seen in `mode_changes`. On the bus the leader sends `0x151`, `0x155`–`0x157`, `0x159`, `0x190`, `0x471` and `0x476` at about 20–70 Hz. Both arms answer the firmware query (`get_firmware()`), and their multi-frame replies interleave into an unreadable version (`'MC\x00\x00ARM_'`) every time; `create_piper_arm()` retries five times, then asks for `PIPER_FIRMWARE`. That environment variable (`default` up to S-V1.8-2, `v183` for S-V1.8-3 to 1.8-7, `v188`, `v189` from S-V1.8-9) skips the query.
+
+`dataset_export` decides whether a take is a demonstration from **the follower's own motion**, never from leader data. `follower_motion()` sums the end-effector path over the exported grid and the total rotation angle (computed on the rotation matrices, so an Euler wrap cannot inflate it); a take whose path is under `MIN_PATH_MM` (10 mm) *and* whose rotation is under `MIN_ROTATION_DEG` (5°) is refused. A follower that received no command stands exactly still, and an arm that was never dragged with teach on does the same, so one rule covers both failures. The numbers land in `export_metadata.json` under `follower_motion`, and `episode_check.py` prints them while you are still at the rig.
+
+The `lead_*` columns are diagnostic only: `leader_missing_share` is printed by `episode_check.py` and written to the export metadata so you can tell "the leader was silent" apart from "the arm was not dragged", but it gates nothing and labels nothing. A `leader_follower` take now exports even when the recordings carry no `lead_*` columns at all, as long as the follower really moved (`--self-check` covers both cases).
+
+One take writes `images/NNNNNN.jpg` for the third view and `images_wrist/NNNNNN.jpg` for the wrist view at the same index, plus one `image_timestamps.parquet` row per pair with `file` and `wrist_file`. The third-view path is unchanged from single-camera takes, so older episodes stay readable: a missing `wrist_file` column is treated as a single-camera take and exports with `wrist_image_index = -1`. `prepare_dataset.collect_segments()` skips a take whose grid has no wrist image, so a rebuild drops the pre-wrist-camera episodes; when nothing is left, the error names how many were skipped. The recorder writes JPEGs on a thread because a pair costs about 30 ms on exFAT under `episodes/`, which alone would drop the loop to 15 Hz, and the loop is paced to `CAPTURE_DT_S = 0.05` so one frame pair lands on each export grid row.
 
 `simple_policy_server.py --mode replay --episode FILE` resamples onto 0.05 s steps with `np.interp`, marks the gripper closed (fully, to 0 mm) once it has closed by `GRIPPER_CLOSED_FRACTION` (30%) of the widest opening in the recording, else fully open (a grasp stops on the object, about 20 mm on a pen, so the old fixed 5 mm threshold never closed it on replay), clamps targets to `JOINT_LIMITS_DEG` (a hand can drag J5 past 70 degrees; it prints `clamped N steps`), and splits any step above 2.4 degrees. Each reply is the next `--chunk` steps (default 50). When the arm is more than 2.4 degrees from the chunk's first row (first chunk, loop restart, or lag), a half-speed `keyframe_chunk()` bridge is prepended. At the end the reply is `{"actions": (0, 7), "done": True}` and `policy_link.py` prints `server_done` and returns; `--loop` restarts instead. Each connection replays from the start. `policy_link.py replay [EPISODE]` does the same without a server (the camera only feeds a preview window; `_with_camera_window()` runs the replay in a thread because macOS draws windows only from the main thread): `replay_episode()` goes to `READY_DEG`, then feeds `Replay.next_chunk()` to the motion worker until it returns nothing, then goes back to `READY_DEG`. `episode_recorder.py` moves to `READY_DEG` before each take (in a motion worker that exits before the recorder opens the adapter), so replays start where the take started.
 
@@ -320,4 +337,4 @@ If the action type, units, or camera fields are still uncertain, do not write an
 
 Verified on one Piper with a candleLight adapter: a passive capture collected `0x2A1`–`0x2A8`, a full gripper stroke left the joints unchanged, the WebSocket delivered an observation and received `(50, 12)`, and one end-effector chunk was followed after teach mode was left.
 
-One Orbbec Astra Pro color camera is connected. Its color frame is in the observation and is copied into all three image fields. Continuous control is the outer loop: play the whole chunk, observe again, then infer again. Not done: separate wrist and right cameras, hand-eye calibration, an item-by-item check of the 16-value state against the training concatenation, joint-space `0x155` commands, and master/slave offsets. This loop does not consume a camera extrinsic. When a model uses a different action meaning, change `action_waypoints()` first.
+Two RealSense D405 color cameras are connected: a third view and a wrist view mounted on the arm. Both frames are in the observation and are padded to 224×224. Continuous control is the outer loop: play the whole chunk, observe again, then infer again. Not done: a right-wrist camera, hand-eye calibration, an item-by-item check of the 16-value state against the training concatenation, joint-space `0x155` commands, and master/slave offsets. This loop does not consume a camera extrinsic. When a model uses a different action meaning, change `action_waypoints()` first.

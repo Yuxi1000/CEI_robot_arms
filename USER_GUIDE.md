@@ -2,17 +2,17 @@
 
 This guide is for people operating the arm. To change code, observation fields, or the CAN protocol, read `DEVELOPER_GUIDE.md`. The Chinese version is `用户文档.md`.
 
-What this does: a Windows or Mac computer reads the arm, captures one Orbbec Astra Pro color frame, copies that same frame into the three image fields, and sends the observation through the local SSH tunnel. Each reply is an end-effector chunk. The computer plays it in the arm base frame, then reads a new state and image and requests the next chunk, until you press `Ctrl+C`. Account, code directory, server name, and model name belong in `team_config.json`. This guide does not hard-code them. On a Mac, use `.venv/bin/python` wherever this guide says `python`.
+What this does: a Windows or Mac computer reads the arm, captures one third-view frame and one wrist frame from two Intel RealSense D405 cameras, sends both as the observation through the local SSH tunnel, and starts the next chunk. Each reply is an end-effector chunk. The computer plays it in the arm base frame, then reads a new state and new frames and requests the next chunk, until you press `Ctrl+C`. Account, code directory, server name, and model name belong in `team_config.json`. This guide does not hard-code them. On a Mac, use `.venv/bin/python` wherever this guide says `python`.
 
 ```mermaid
 flowchart LR
   arm[Piper]
-  cam[Orbbec Astra Pro]
+  cam[RealSense D405 x2]
   pc[Windows or Mac]
   login[Login node]
   gpu[Model on a compute node]
   arm -->|CAN| pc
-  cam -->|same frame| pc
+  cam -->|third view + wrist| pc
   pc -->|SSH tunnel| login
   login -->|SSH tunnel| gpu
   gpu -->|end-effector chunk| pc
@@ -44,7 +44,7 @@ flowchart LR
 
 Run the one-time setup in the developer guide (`brew install libusb` and the `.venv`, which includes `python-can` and `pyAgxArm`), then use `.venv/bin/python` in place of `python` below. Before the first run:
 
-1. Allow camera access for Terminal (System Settings > Privacy & Security > Camera). The Astra Pro is found automatically; `.venv/bin/python policy_link.py preview` shows what it sees live, and q closes the window. Only if it picks the wrong camera, put the right number from `policy_link.py cameras` in `camera_index`.
+1. Allow camera access for Terminal (System Settings > Privacy & Security > Camera). Fill `third_view_serial` and `wrist_serial` in `team_config.json`. Confirm the two are not swapped before recording: `python _realsense_test.py` writes labelled pictures to `_camera_test/`, and `policy_link.py cameras --motion-check` reports which camera moves when you move the arm (that one is the wrist view). `policy_link.py preview` shows both streams live (q closes the windows).
 2. With `server_mode` set to `"simple"`, `.venv/bin/python team_config.py setup-remote` copies the test server to athena once. Fill `slurm_partition` first.
 3. Leave room around the arm. The test server moves the end effector 10 mm along +X and back each chunk and opens or closes the gripper. A chunk farther than `max_chunk_shift_mm` from its start is refused before anything is sent.
 
@@ -76,6 +76,14 @@ Without a folder it plays the newest recording. No server is needed. A window sh
 
 `--server openpi` serves the checkpoint in `checkpoint_dir` with `openpi_python` on a GPU; `mode_overrides.openpi` holds its partition, memory, and time. The first reply can take minutes while the model compiles.
 
+Before a first real run, check the link without moving the arm. This sends real observations with both camera frames and the arm state, prints what went out and what came back, and applies nothing:
+
+```bash
+.venv/bin/python team_config.py run --server openpi --observe-only --cycles 3
+```
+
+The arm must not move at all. Each cycle prints one `observation/image` line, one `observation/wrist_image` line with a different mean, `third_vs_wrist_mad` well above 1.0, the decoded `observation/state`, and then the returned chunk: `actions shape=(50, 12)`. A `WARNING` about an all-zero chunk means the server is still the placeholder. A string reply instead of a chunk is the server's own exception text, so it names the observation key it did not like. When that looks right, run the loop for real:
+
 ```bash
 .venv/bin/python team_config.py down
 .venv/bin/python team_config.py run --server openpi --ready
@@ -90,11 +98,11 @@ Without a folder it plays the newest recording. No server is needed. A window sh
 - The language instruction is the `prompt` field in `policy_link.py`. Change that English sentence before a run. There is no separate command-line prompt.
 - Do not install a fresh environment on the compute node. Use the Python already installed under `openpi_dir`.
 - Do not copy a job script or an SSH forward from this guide onto the login node. `run`, `once`, and `down` connect by themselves.
-- Do not run `run` or `once` while recording a demonstration. The camera is busy.
+- Do not run `run` or `once` while recording a demonstration. The cameras are busy.
 
 ## Record a demonstration
 
-This stores a person dragging the arm (recording with a leader arm is at the end of this section). First the program moves the arm to the ready pose, so every recording (and its replay) starts from the same place; add `--no-ready` to skip that. Then it asks you to turn on drag-teach and press Enter. While recording it only reads the arm and the camera, and a window shows the camera live (`--no-preview` hides it; over SSH there is no window). Run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
+This stores a person dragging the arm (recording with a leader arm is at the end of this section). First the program moves the arm to the ready pose, so every recording (and its replay) starts from the same place; add `--no-ready` to skip that. Then it asks you to turn on drag-teach and press Enter. While recording it only reads the arm and the two cameras, and a window shows the third view and the wrist view side by side (`--no-preview` hides it; over SSH there is no window). Run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
 
 ```powershell
 python collect.py --task "put the pen in the box"
@@ -126,7 +134,7 @@ python collect.py --leader --task "put the pen in the box"
 
 With the leader on the bus, both arms answer the firmware-version query and the replies interleave, so the program stops with `unreadable firmware version`. Then name the follower's firmware profile before the command: on a Mac or Linux `PIPER_FIRMWARE=v189 .venv/bin/python collect.py --leader ...`, in Windows PowerShell first `$env:PIPER_FIRMWARE="v189"`. `v189` covers S-V1.8-9 and later (this follower runs S-V1.9-0); see `DEVELOPER_GUIDE.md` for the others.
 
-The program does not move the arm in this mode. Use the leader to bring the follower to the start pose, press Enter to start recording, and finish with the same keys as above. Recording only reads the bus and the camera. The leader's commands are stored as well, but the training labels still come from the follower's measured pose. `teaching_fraction` is now the share of time the follower is in a following mode and should be close to 1; if it is 0, send that episode's `mode_changes` to whoever maintains the code. Before inference, unplug the leader (its commands would fight the policy's), set the former leader back to follower mode, and power-cycle it.
+The program does not move the arm in this mode. Use the leader to bring the follower to the start pose, press Enter to start recording, and finish with the same keys as above. Recording only reads the bus and the two cameras. The leader's commands are stored as well, but they are only a diagnostic: they never become a training label and the export never decides anything from them. `teaching_fraction` is now the share of time the follower is in a following mode and should be close to 1; if it is 0, send that episode's `mode_changes` to whoever maintains the code. What the export does refuse is a take where **the follower itself never moved**: `follower_path_mm` under 10 mm with less than 5° of rotation means nothing ever commanded or dragged the arm, and `episode_check.py` prints that number right after recording. Before inference, unplug the leader (its commands would fight the policy's), set the former leader back to follower mode, and power-cycle it.
 
 ## Run once
 
@@ -148,7 +156,7 @@ python team_config.py run
 2. Submit a job named `serve-policy` when you do not already have one, and reuse it when you do. `--port` is placed before `policy:checkpoint`.
 3. Check the job about every 10 seconds. After the log says the server is listening, read the compute-node address. Warnings from a simulator while the model loads can be ignored for now. Do not SSH into the compute node; SSH can hang while the node is busy.
 4. Open the local forward. On Windows this is a window titled `piper-link`: type the SSH password once more there, then leave it open. On a Mac the forward runs in the background and there is no window.
-5. Read the arm and the Astra Pro, send an observation, execute the chunk after `execute_steps` and `ee_delta_scale`, then start the next chunk. The port is `local_forward_port`. The arm moves. Press `Ctrl+C` to stop the loop.
+5. Read the arm and both D405 cameras, send one observation, execute the chunk after `execute_steps` and `ee_delta_scale`, then start the next chunk. The port is `local_forward_port`. The arm moves. Press `Ctrl+C` to stop the loop.
 
 While the server and the forward are still up, start another continuous run without submitting again:
 
@@ -174,7 +182,7 @@ observation_sent
 waiting_for_inference
 ```
 
-After `waiting_for_inference`, the first model compilation can take several minutes. The run should then show `cycle=1`, `image_mean`, `complete=True`, `actions_shape=(50, 12)`, `command_steps=50`, and `pose_sent`. `image_mean` should be well above 0. After a chunk, `after` prints the new pose and `cycle=2` starts.
+After `waiting_for_inference`, the first model compilation can take several minutes. The run should then show `cycle=1`, the `observation/image` and `observation/wrist_image` lines with different means, `third_vs_wrist_mad`, `complete=True`, `actions shape=(50, 12)`, `command_steps=50`, and `pose_sent`. Both means should be well above 0. After a chunk, `after` prints the new pose and `cycle=2` starts.
 
 A chunk that reached its target shows `CAN_CTRL` and `motion=0`. The pose under `after` should be close to the `target_mm_deg` printed for that chunk. If the server reports a missing observation field, `build_observation()` does not yet match that model. See the developer guide.
 
@@ -186,7 +194,11 @@ A chunk that reached its target shows `CAN_CTRL` and `motion=0`. The pose under 
 | `gripper_mm` | Gripper opening, in millimeters |
 | `pose_mm_deg` | End-effector position in millimeters and orientation in degrees |
 | `complete=True` | Joints, gripper, pose, and status were all received |
-| `image_mean` | Average brightness of the Orbbec Astra Pro color frame after padding to 224×224. Only one camera is connected, so that same frame fills the external, wrist, and right image fields |
+| `observation/image` | Shape, dtype, and average brightness of the third-view D405 frame after padding to 224×224. It is sent under that key and reaches `base_0_rgb` |
+| `observation/wrist_image` | The same for the wrist D405 frame. It is sent as `observation/wrist_image` and reaches `left_wrist_0_rgb`. A mean near 0 means that camera returned an empty frame |
+| `third_vs_wrist_mad` | Mean absolute difference between the two model inputs. Under 1.0 means both slots carry the same picture, so the camera serials are the wrong way round |
+| `observation/state` | The 16 numbers sent as `observation/state`: position in mm, quaternion xyzw, six static body dims that must stay 0, and the gripper split into two finger openings in mm |
+| `actions shape=(50, 12)` | Shape of the chunk that came back. `translation_mm_total` and `rotation_deg_total` are what the whole chunk would move if it were applied |
 | `cycle` | Which chunk this is. Each chunk captures a new frame and requests a new inference |
 | `command_steps` | How many steps of this chunk were sent. With `execute_steps` empty, every step the model returned is sent |
 | `shift_mm` | Total end-effector translation of this chunk, in millimeters |

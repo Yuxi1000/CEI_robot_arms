@@ -5,15 +5,14 @@ msgpack metadata first, then each client message is one msgpack observation
 and each reply is one msgpack dict. NumPy arrays use the same ``__ndarray__``
 encoding as ``openpi_client.msgpack_numpy``.
 
-The single Astra Pro color frame is sent as ``observation/image``. Each reply is one
-action chunk. The client plays that chunk, then sends a new observation.
+The third-view D405 frame is sent as ``observation/image`` and the wrist D405
+frame as ``observation/wrist_image``; both are padded to 224x224 RGB. Each reply
+is one action chunk. The client plays that chunk, then sends a new observation.
 Ctrl+C stops the loop. Operators use USER_GUIDE.md; protocol and code notes are in DEVELOPER_GUIDE.md.
 """
 
 import argparse
-import ctypes
 import os
-from ctypes import POINTER, Structure, byref, c_void_p
 import sys
 import time
 from pathlib import Path
@@ -24,11 +23,20 @@ import websockets.sync.client
 import websockets.sync.server
 
 from piper_client import format_state
+from policy_cameras import (
+    IMAGE_SHAPE,
+    THIRD_VIEW,
+    WRIST,
+    PolicyCameras,
+    model_image,
+    motion_check,
+    preview,
+    probe_cameras,
+    side_by_side,
+)
 
 HOST = "127.0.0.1"
 PORT = 8765
-IMAGE_SHAPE = (224, 224, 3)
-COLOR_CAMERA_ID = "vid_2bc5&pid_0501"
 # The only string in meta/tasks.jsonl. The tokenizer strips and replaces underscores;
 # it does not lower-case, so this must match the dataset character for character.
 PROMPT = "put the pen into the box"
@@ -70,333 +78,6 @@ def black_image():
     return np.zeros(IMAGE_SHAPE, dtype=np.uint8)
 
 
-def resize_with_pad(image, height, width):
-    import cv2
-
-    source_h, source_w = image.shape[:2]
-    scale = min(width / source_w, height / source_h)
-    resized_w = max(1, int(round(source_w * scale)))
-    resized_h = max(1, int(round(source_h * scale)))
-    resized = cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
-    canvas = np.zeros((height, width, 3), dtype=np.uint8)
-    y0 = (height - resized_h) // 2
-    x0 = (width - resized_w) // 2
-    canvas[y0 : y0 + resized_h, x0 : x0 + resized_w] = resized
-    return canvas
-
-
-def _directshow_names():
-    """Return DirectShow video-device display names in OpenCV's index order."""
-    ole32 = ctypes.windll.ole32
-    ole32.CoInitialize(None)
-
-    class GUID(Structure):
-        _fields_ = [
-            ("Data1", ctypes.c_ulong),
-            ("Data2", ctypes.c_ushort),
-            ("Data3", ctypes.c_ushort),
-            ("Data4", ctypes.c_ubyte * 8),
-        ]
-
-    def guid(text):
-        value = GUID()
-        if ole32.CLSIDFromString(text, byref(value)) != 0:
-            raise RuntimeError(text)
-        return value
-
-    def com_method(pointer, slot, prototype):
-        vtable = ctypes.cast(pointer, POINTER(c_void_p))[0]
-        return prototype(ctypes.cast(vtable, POINTER(c_void_p))[slot])
-
-    def release(pointer):
-        if pointer:
-            com_method(pointer, 2, ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p))(pointer)
-
-    system_enum = guid("{62BE5D10-60EB-11d0-BD3B-00A0C911CE86}")
-    video_category = guid("{860BB310-5D01-11d0-BD3B-00A0C911CE86}")
-    create_enum_iid = guid("{29840822-5B84-11D0-BD3B-00A0C911CE86}")
-    enumerator = c_void_p()
-    hr = ole32.CoCreateInstance(byref(system_enum), None, 1, byref(create_enum_iid), byref(enumerator))
-    if hr != 0:
-        raise OSError(f"camera enumeration failed hr={hr:#x}")
-    create = com_method(
-        enumerator,
-        3,
-        ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(GUID), POINTER(c_void_p), ctypes.c_ulong),
-    )
-    devices = c_void_p()
-    hr = create(enumerator, byref(video_category), byref(devices), 0)
-    if hr != 0:
-        release(enumerator)
-        raise OSError(f"camera enumeration failed hr={hr:#x}")
-    next_device = com_method(
-        devices,
-        3,
-        ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, ctypes.c_ulong, POINTER(c_void_p), POINTER(ctypes.c_ulong)),
-    )
-    bind_ctx = c_void_p()
-    ole32.CreateBindCtx.argtypes = [ctypes.c_ulong, POINTER(c_void_p)]
-    ole32.CreateBindCtx.restype = ctypes.c_long
-    if ole32.CreateBindCtx(0, byref(bind_ctx)) != 0:
-        release(devices)
-        release(enumerator)
-        raise OSError("camera enumeration failed while creating a bind context")
-    names = []
-    while True:
-        moniker = c_void_p()
-        fetched = ctypes.c_ulong()
-        hr = next_device(devices, 1, byref(moniker), byref(fetched))
-        if hr != 0 or not fetched.value:
-            break
-        display = c_void_p()
-        get_name = com_method(
-            moniker,
-            20,
-            ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, c_void_p, c_void_p, POINTER(c_void_p)),
-        )
-        text = ""
-        if get_name(moniker, bind_ctx, None, byref(display)) == 0 and display.value:
-            text = ctypes.wstring_at(display.value)
-            ole32.CoTaskMemFree(display)
-        names.append(text)
-        release(moniker)
-    release(bind_ctx)
-    release(devices)
-    release(enumerator)
-    return names
-
-
-def color_camera_index():
-    """Index of the Astra Pro color camera. The IR and laptop cameras are skipped."""
-    names = _directshow_names()
-    for index, name in enumerate(names):
-        if COLOR_CAMERA_ID in name.lower():
-            return index
-    raise RuntimeError("Astra Pro color camera was not found (USB VID_2BC5 PID_0501)")
-
-
-def _avfoundation_devices():
-    """Video devices in OpenCV's macOS index order (sorted by uniqueID), or [] without pyobjc."""
-    try:
-        import AVFoundation
-    except ImportError:
-        return []
-    devices = AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeVideo)
-    devices = sorted(devices, key=lambda device: str(device.uniqueID()))
-    return [(str(device.localizedName()), str(device.modelID())) for device in devices]
-
-
-def _configured_camera_index():
-    """camera_index in team_config.json wins; on macOS the Astra Pro is otherwise found by USB ID."""
-    from team_config import load
-
-    value = load().get("camera_index")
-    if value not in ("", None):
-        return int(value)
-    # The UVC model ID carries the USB IDs in decimal: 0x2BC5 = 11205, 0x0501 = 1281.
-    for index, (_name, model) in enumerate(_avfoundation_devices()):
-        if "VendorID_11205 ProductID_1281" in model:
-            return index
-    raise RuntimeError(
-        "Astra Pro color camera not found. Plug it in, or set camera_index in team_config.json "
-        "(python policy_link.py cameras lists the indexes)"
-    )
-
-
-def _v4l2_camera_index():
-    """Linux: N of the /dev/videoN whose USB IDs are 2BC5:0501 and whose V4L2 index is 0 (the capture node)."""
-    from pathlib import Path
-
-    for node in sorted(Path("/sys/class/video4linux").glob("video*"), key=lambda path: int(path.name[5:])):
-        usb = node.joinpath("device").resolve().parent
-        try:
-            ids = (usb / "idVendor").read_text().strip(), (usb / "idProduct").read_text().strip()
-            capture_node = (node / "index").read_text().strip() == "0"
-        except OSError:
-            continue
-        if ids == ("2bc5", "0501") and capture_node:
-            return int(node.name[5:])
-    raise RuntimeError("Astra Pro color camera (USB 2BC5:0501) not found under /sys/class/video4linux")
-
-
-def policy_camera_index():
-    """Astra Pro index: DirectShow on Windows, V4L2 on Linux, AVFoundation on macOS; camera_index overrides off Windows."""
-    if sys.platform == "win32":
-        return color_camera_index()
-    if sys.platform.startswith("linux"):
-        from team_config import load
-
-        value = load().get("camera_index")
-        return int(value) if value not in ("", None) else _v4l2_camera_index()
-    return _configured_camera_index()
-
-
-def open_policy_camera():
-    """Open the Astra Pro with this platform's capture backend. Returns (capture, index)."""
-    index = policy_camera_index()
-    return _open_capture(index), index
-
-
-def _open_capture(index):
-    import cv2
-
-    if sys.platform == "win32":
-        return cv2.VideoCapture(index, cv2.CAP_DSHOW)
-    if sys.platform == "darwin":
-        return cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
-    if sys.platform.startswith("linux"):
-        return cv2.VideoCapture(index, cv2.CAP_V4L2)
-    return cv2.VideoCapture(index)
-
-
-def list_cameras(count=6):
-    """Print every camera index that returns a frame, so the Astra Pro index can be chosen."""
-    if sys.platform == "win32":
-        names = _directshow_names()
-    else:
-        names = [name for name, _model in _avfoundation_devices()]
-    opened = 0
-    for index in range(count):
-        capture = _open_capture(index)
-        try:
-            if not capture.isOpened():
-                continue
-            opened += 1
-            frame = None
-            for _ in range(10):
-                ok, frame = capture.read()
-                if not ok:
-                    frame = None
-            name = names[index] if index < len(names) else ""
-            if frame is None:
-                print(f"camera={index} opened, no frame {name}", flush=True)
-            else:
-                print(f"camera={index} shape={frame.shape} mean={float(frame.mean()):.1f} {name}", flush=True)
-        finally:
-            capture.release()
-    if not opened and sys.platform == "darwin":
-        print(
-            "No camera opened. Allow camera access for the app running this command "
-            "(System Settings > Privacy & Security > Camera), then reopen that app.",
-            flush=True,
-        )
-
-
-def capture_color_bgr():
-    """Return one BGR frame from the Astra Pro color camera."""
-    import cv2
-
-    index = policy_camera_index()
-    capture = _open_capture(index)
-    if not capture.isOpened():
-        raise RuntimeError(f"could not open Astra Pro color camera at index {index}")
-    try:
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        frame = None
-        for _ in range(15):
-            ok, frame = capture.read()
-            if not ok:
-                frame = None
-        if frame is None:
-            raise RuntimeError("Astra Pro returned no color frame")
-        return frame
-    finally:
-        capture.release()
-
-
-def preview(index=None):
-    """Live window of the camera the policy loop uses. q or Esc closes it."""
-    import cv2
-
-    if index is None:
-        index = policy_camera_index()
-    capture = _open_capture(index)
-    if not capture.isOpened():
-        raise RuntimeError(f"could not open camera {index}")
-    title = f"camera {index} (q to quit)"
-    try:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                continue
-            rgb = np.ascontiguousarray(frame[:, :, ::-1])
-            model_view = resize_with_pad(rgb, IMAGE_SHAPE[0], IMAGE_SHAPE[1])[:, :, ::-1]
-            height = frame.shape[0]
-            inset = cv2.resize(model_view, (height // 3, height // 3), interpolation=cv2.INTER_NEAREST)
-            frame[: inset.shape[0], : inset.shape[1]] = inset
-            cv2.putText(frame, "model input 224x224", (8, inset.shape[0] + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.imshow(title, frame)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-                break
-    finally:
-        capture.release()
-        cv2.destroyAllWindows()
-
-
-def model_image(bgr):
-    """RGB copy of a BGR camera frame, padded to the 224x224 model input."""
-    rgb = np.ascontiguousarray(bgr[:, :, ::-1])
-    return resize_with_pad(rgb, IMAGE_SHAPE[0], IMAGE_SHAPE[1])
-
-
-class LiveCamera:
-    """The Astra Pro kept open for a whole session. A thread keeps only the newest frame.
-
-    Opening the camera for every observation took about a second on macOS.
-    """
-
-    # Frames dropped after opening while auto exposure settles.
-    WARMUP_FRAMES = 15
-
-    def __enter__(self):
-        import threading
-
-        import cv2
-
-        self._capture, index = open_policy_camera()
-        if not self._capture.isOpened():
-            raise RuntimeError(f"could not open Astra Pro color camera at index {index}")
-        self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self._lock = threading.Lock()
-        self._frame = None
-        self._stamp = 0.0
-        self._count = 0
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc):
-        self._running = False
-        self._thread.join(timeout=1.0)
-        self._capture.release()
-
-    def _run(self):
-        while self._running:
-            ok, frame = self._capture.read()
-            if ok and frame is not None:
-                with self._lock:
-                    self._frame, self._stamp, self._count = frame, time.perf_counter(), self._count + 1
-
-    def latest_bgr(self):
-        """Newest frame after warm-up, or None; does not wait."""
-        with self._lock:
-            return self._frame if self._count > self.WARMUP_FRAMES else None
-
-    def read_bgr(self, timeout=3.0):
-        """Return the first frame captured after this call, so it shows the arm where it is now."""
-        asked = time.perf_counter()
-        while True:
-            with self._lock:
-                if self._frame is not None and self._stamp > asked and self._count > self.WARMUP_FRAMES:
-                    return self._frame
-            if time.perf_counter() - asked > timeout:
-                raise RuntimeError("Astra Pro returned no color frame")
-            time.sleep(0.005)
-
-
 def piper_train_state(state):
     """16-d state in the order ``prepare_dataset.piper_train_state()`` writes.
 
@@ -429,19 +110,21 @@ def piper_train_state(state):
     return vector
 
 
-def build_observation(state, image):
+def build_observation(state, image, wrist_image):
     """Package live arm feedback for the pi05_piper_finetune server.
 
-    Only ``observation/image`` is sent. The config feeds it to base_0_rgb and masks
-    both wrist slots, so the frame must not be copied into them. The frame is
-    already RGB: model_image flips the BGR one, and the server does not flip.
+    ``observation/image`` is the third-view camera and ``observation/wrist_image``
+    the wrist camera; the config feeds them to base_0_rgb and left_wrist_0_rgb and
+    masks right_wrist_0_rgb. Both frames are already RGB: model_image flips the BGR
+    ones, and the server does not flip.
     """
     if not state["complete"]:
         raise RuntimeError("arm feedback is incomplete")
-    if image.shape != (*IMAGE_SHAPE,) or image.dtype != np.uint8:
-        raise RuntimeError(f"image must be uint8 {IMAGE_SHAPE}")
+    _require_image(image, "image")
+    _require_image(wrist_image, "wrist_image")
     return {
         "observation/image": image,
+        "observation/wrist_image": wrist_image,
         "observation/state": piper_train_state(state),
         # Extra key for scripted servers that command joints; model servers ignore it.
         "observation/joints_deg": np.asarray(state["joints_deg"], dtype=np.float32),
@@ -461,6 +144,7 @@ def handle_connection(websocket):
                 "protocol": "openpi-websocket",
                 "model": "zero-action-placeholder",
                 "image_shape": list(IMAGE_SHAPE),
+                "wrist_image_shape": list(IMAGE_SHAPE),
                 "execute": False,
             }
         )
@@ -470,10 +154,15 @@ def handle_connection(websocket):
             observation = unpackb(message)
             image = observation["observation/image"]
             _require_image(image, "observation/image")
-            # The fine-tune config masks the wrist slots, so these keys are optional.
-            for name in ("observation/wrist_image", "observation/right_image"):
-                if name in observation:
-                    _require_image(observation[name], name)
+            if "observation/wrist_image" not in observation:
+                raise ValueError(
+                    "observation/wrist_image is missing: this build sends both D405 frames and the "
+                    "pi05_piper_finetune config expects base_0_rgb plus left_wrist_0_rgb"
+                )
+            wrist = observation["observation/wrist_image"]
+            _require_image(wrist, "observation/wrist_image")
+            if "observation/right_image" in observation:
+                _require_image(observation["observation/right_image"], "observation/right_image")
             proprio = observation["observation/state"]
             if getattr(proprio, "shape", None) != (16,):
                 raise ValueError(f"observation/state shape is {getattr(proprio, 'shape', None)}")
@@ -481,6 +170,7 @@ def handle_connection(websocket):
                 "received "
                 f"state={np.array2string(proprio, precision=3, separator=',')} "
                 f"image_mean={float(image.mean()):.1f} "
+                f"wrist_mean={float(wrist.mean()):.1f} "
                 f"prompt={observation.get('prompt')!r}",
                 flush=True,
             )
@@ -673,13 +363,13 @@ def replay_episode(path, speed=None, freq=None, loop=False, preview=True):
 
 
 def _with_camera_window(task, status):
-    """Run task in a thread while this (main) thread shows the camera; macOS draws windows only from the main thread."""
+    """Run task in a thread while this (main) thread shows the cameras; macOS draws windows only from the main thread."""
     import threading
 
     import cv2
 
     try:
-        camera = LiveCamera().__enter__()
+        cameras = PolicyCameras().__enter__()
     except RuntimeError as exc:
         print(f"preview off: {exc}", flush=True)
         task()
@@ -694,35 +384,93 @@ def _with_camera_window(task, status):
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    title = "replay camera (Ctrl+C in the terminal stops)"
+    title = "replay cameras (Ctrl+C in the terminal stops)"
     try:
         while thread.is_alive():
-            frame = camera.latest_bgr()
-            if frame is not None:
-                view = frame.copy()
-                cv2.putText(view, status["text"], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            frames = cameras.latest_bgr()
+            if all(frame is not None for frame in frames.values()):
+                view = side_by_side(frames, (THIRD_VIEW, WRIST))
+                cv2.putText(view, status["text"], (10, view.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow(title, view)
             cv2.waitKey(30)
     finally:
-        camera.__exit__(None, None, None)
+        cameras.__exit__(None, None, None)
         cv2.destroyAllWindows()
     if "error" in outcome:
         raise outcome["error"]
 
 
-def infer_once(host, port, speed=None, freq=None, ready=False):
+def infer_once(host, port, speed=None, freq=None, ready=False, observe_only=False, cycles=None):
     """Read, infer, and execute until Ctrl+C or the server says done.
 
-    The server connection, the camera, and the motion worker stay open for the
+    The server connection, the cameras, and the motion worker stay open for the
     whole loop, so chunks follow each other with only the inference in between.
+    With observe_only the loop still reads the arm and both cameras and still
+    receives a chunk, but nothing is sent to the arm: it is the check that the
+    observation contract works before a single frame can move.
     """
-    with MotionWorker() as worker, LiveCamera() as camera:
-        if ready:
+    with MotionWorker() as worker, PolicyCameras() as cameras:
+        if ready and not observe_only:
             go_ready(speed=speed, freq=freq, worker=worker)
-        _control_loop(host, port, worker, camera, speed, freq)
+        _control_loop(host, port, worker, cameras, speed, freq, observe_only, cycles)
 
 
-def _control_loop(host, port, worker, camera, speed, freq):
+def describe_observation(state, image, wrist_image):
+    """One block of text proving both camera streams and the 16-d state are what we think they are."""
+    vector = piper_train_state(state)
+    difference = float(np.abs(image.astype(np.int16) - wrist_image.astype(np.int16)).mean())
+    lines = [
+        f"observation/image        shape={image.shape} dtype={image.dtype} "
+        f"mean={float(image.mean()):.1f}",
+        f"observation/wrist_image  shape={wrist_image.shape} dtype={wrist_image.dtype} "
+        f"mean={float(wrist_image.mean()):.1f}",
+        f"third_vs_wrist_mad={difference:.1f}"
+        + ("  WARNING: the two model inputs are nearly identical; check the camera roles" if difference < 1.0 else ""),
+        "observation/state        shape=(16,) dtype=float32 "
+        f"xyz_mm=({vector[0] * 1000:.1f}, {vector[1] * 1000:.1f}, {vector[2] * 1000:.1f}) "
+        f"quat_xyzw=({vector[3]:.3f}, {vector[4]:.3f}, {vector[5]:.3f}, {vector[6]:.3f}) "
+        f"body={vector[7:13].tolist()} open={vector[13]:.1f} "
+        f"fingers_mm=({vector[14] * 2000:.1f}, {vector[15] * 2000:.1f})",
+        f"prompt                   {PROMPT!r}",
+    ]
+    return "\n".join(lines)
+
+
+def describe_actions(actions, action_space):
+    """What the server returned, decoded far enough to see it is a real chunk and not a placeholder."""
+    actions = np.asarray(actions)
+    expected = (ACTION_HORIZON, 7) if action_space == "joints" else (ACTION_HORIZON, ACTION_DIM)
+    lines = [f"actions shape={actions.shape} dtype={actions.dtype} action_space={action_space}"]
+    if actions.ndim != 2:
+        lines.append(f"WARNING: the chunk is not two-dimensional: {actions.shape}")
+    elif actions.shape != expected:
+        lines.append(f"WARNING: expected {expected} for action_space={action_space}, got {actions.shape}")
+    if not np.all(np.isfinite(actions)):
+        lines.append(f"WARNING: {int((~np.isfinite(actions)).sum())} non-finite entries in the chunk")
+        return "\n".join(lines)
+    if action_space == "joints":
+        for index in range(min(actions.shape[1], 7)):
+            column = actions[:, index]
+            lines.append(
+                f"  col{index} {'gripper' if index == 6 else f'j{index + 1}_deg':>9} "
+                f"min={column.min():.3f} max={column.max():.3f} mean={column.mean():.3f}"
+            )
+        return "\n".join(lines)
+    translation = actions[:, 0:3] * 0.05 * 1000.0
+    rotation = actions[:, 3:6] * 0.5 * 180.0 / np.pi
+    lines.append(
+        f"  translation_mm_total=({translation.sum(axis=0)[0]:.2f}, {translation.sum(axis=0)[1]:.2f}, "
+        f"{translation.sum(axis=0)[2]:.2f})  rotation_deg_total=({rotation.sum(axis=0)[0]:.2f}, "
+        f"{rotation.sum(axis=0)[1]:.2f}, {rotation.sum(axis=0)[2]:.2f})"
+    )
+    lines.append(f"  gripper_close_mean={float(actions[:, 6].mean()):.3f} (0 open, 1 closed)")
+    lines.append(f"  columns_7_11_max_abs={float(np.abs(actions[:, 7:12]).max()) if actions.shape[1] > 7 else 0.0:.4f}")
+    if float(np.abs(actions).max()) == 0.0:
+        lines.append("WARNING: the chunk is all zeros; the server is still a placeholder")
+    return "\n".join(lines)
+
+
+def _control_loop(host, port, worker, cameras, speed, freq, observe_only=False, cycles=None):
     connection = _connect_policy(host, port)
     with connection as websocket:
         metadata = unpackb(websocket.recv(timeout=30))
@@ -737,9 +485,11 @@ def _control_loop(host, port, worker, camera, speed, freq):
                 state = worker.read_state()
                 if not state["complete"]:
                     raise RuntimeError("arm feedback is incomplete")
-                image = model_image(camera.read_bgr())
-                observation = build_observation(state, image)
-                print(f"image_mean={float(image.mean()):.1f}", flush=True)
+                frames = cameras.read_bgr()
+                image = model_image(frames[THIRD_VIEW])
+                wrist_image = model_image(frames[WRIST])
+                observation = build_observation(state, image, wrist_image)
+                print(describe_observation(state, image, wrist_image), flush=True)
                 print(format_state(state), flush=True)
                 websocket.send(packb(observation))
                 print("waiting_for_inference", flush=True)
@@ -748,9 +498,15 @@ def _control_loop(host, port, worker, camera, speed, freq):
                     print("server_done", flush=True)
                     break
                 action_space = str(result.get("action_space", "ee_delta"))
-                print(f"actions_shape={tuple(actions.shape)} action_space={action_space}", flush=True)
-                print("applying", flush=True)
-                worker.apply(actions, action_space, speed=speed, freq=freq)
+                print(describe_actions(actions, action_space), flush=True)
+                if observe_only:
+                    print("observe_only: chunk not applied; the arm has not moved", flush=True)
+                else:
+                    print("applying", flush=True)
+                    worker.apply(actions, action_space, speed=speed, freq=freq)
+                if cycles is not None and cycle >= cycles:
+                    print(f"stopped after {cycle} cycle(s)", flush=True)
+                    break
         except KeyboardInterrupt:
             print("stopped", flush=True)
 
@@ -759,7 +515,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("serve", "once", "cameras", "preview", "ready", "home", "replay"))
     parser.add_argument("episode", nargs="?", help="replay: episode folder; default is the newest one in episodes/")
-    parser.add_argument("--index", type=int, help="camera index for preview; default is the policy camera")
     parser.add_argument("--speed", type=int, help="joint speed percent for joint actions; default joint_speed in team_config.json")
     parser.add_argument("--freq", type=float, help="joint target updates per second; 20 holds one target per step; default 100")
     parser.add_argument("--ready", action="store_true", help="once: unfold to the ready pose before the first observation")
@@ -767,12 +522,27 @@ def main():
     parser.add_argument("--loop", action="store_true", help="replay: play the episode again and again, through the ready pose, until Ctrl+C")
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int)
+    parser.add_argument(
+        "--motion-check",
+        action="store_true",
+        help="cameras: after a still from each, move the arm and press Enter; the camera that "
+        "moved is the wrist view",
+    )
+    parser.add_argument(
+        "--observe-only",
+        action="store_true",
+        help="once: send observations and print the returned chunk without applying it; the arm does not move",
+    )
+    parser.add_argument("--cycles", type=int, help="once: stop after this many observations instead of running until Ctrl+C")
     args = parser.parse_args()
     if args.mode == "cameras":
-        list_cameras()
+        if args.motion_check:
+            motion_check()
+        else:
+            probe_cameras()
         return
     if args.mode == "preview":
-        preview(args.index)
+        preview()
         return
     if args.mode == "ready":
         go_ready(speed=args.speed, freq=args.freq)
@@ -796,7 +566,15 @@ def main():
     if args.mode == "serve":
         serve(args.host, port)
     else:
-        infer_once(args.host, port, speed=args.speed, freq=args.freq, ready=args.ready)
+        infer_once(
+            args.host,
+            port,
+            speed=args.speed,
+            freq=args.freq,
+            ready=args.ready,
+            observe_only=args.observe_only,
+            cycles=args.cycles,
+        )
 
 
 if __name__ == "__main__":
