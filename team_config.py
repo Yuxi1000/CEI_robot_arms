@@ -67,7 +67,7 @@ def configured_port(config=None):
     return int(value)
 
 
-SIMPLE_SERVER_FILES = ("simple_policy_server.py", "policy_link.py", "piper_client.py")
+SIMPLE_SERVER_FILES = ("simple_policy_server.py", "policy_link.py", "policy_cameras.py", "piper_client.py")
 
 
 SERVER_MODES = ("simple", "replay", "openpi")
@@ -493,6 +493,10 @@ def main():
         extra += ["--speed", str(args.speed)]
     if args.freq is not None:
         extra += ["--freq", str(args.freq)]
+    if args.observe_only:
+        extra.append("--observe-only")
+    if args.cycles is not None:
+        extra += ["--cycles", str(args.cycles)]
     if args.mode == "run":
         run(config, extra)
     elif args.mode == "up":
@@ -524,6 +528,12 @@ def argparse_parser():
     parser.add_argument("--ready", action="store_true", help="unfold to the ready pose before the first observation")
     parser.add_argument("--speed", type=int, help="joint speed percent, passed to policy_link.py once")
     parser.add_argument("--freq", type=float, help="joint target updates per second, passed to policy_link.py once")
+    parser.add_argument(
+        "--observe-only",
+        action="store_true",
+        help="once/run: send observations and print the chunk without applying it; the arm does not move",
+    )
+    parser.add_argument("--cycles", type=int, help="once/run: stop after this many observations")
     return parser
 
 

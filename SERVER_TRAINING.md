@@ -12,6 +12,7 @@ Copy `datasets/piper_finetune` only. Leave out `team_config.json` and `episodes/
 piper_finetune/
   data/chunk-000/episode_NNNNNN.parquet
   videos/chunk-000/observation.images.agentview_left/episode_NNNNNN.mp4
+  videos/chunk-000/observation.images.wrist_left/episode_NNNNNN.mp4
   meta/info.json
   meta/stats.json
   meta/modality.json
@@ -59,7 +60,9 @@ Use `meta/stats.json` from this folder. `observation.state` and `action` each ha
 
 ## Images
 
-There is one stream, `observation.images.agentview_left`. Feed it to `base_0_rgb`. Set `image_mask` false for `left_wrist_0_rgb` and `right_wrist_0_rgb`. A missing `observation/right_image` must not raise, and this frame must not be copied into the other two slots.
+There are two streams. Feed `observation.images.agentview_left` to `base_0_rgb` and `observation.images.wrist_left` to `left_wrist_0_rgb`. Set `image_mask` false only for `right_wrist_0_rgb`. A missing `observation/right_image` must not raise, and neither frame must be copied into another slot.
+
+If the wrist key in this openpi checkout's `LeRobotRobocasaDataConfig.image_keys` is not `observation.images.wrist_left`, change `WRIST_VIDEO_KEY` at the top of `prepare_dataset.py` and repack the dataset instead of writing the name in two places.
 
 `ResizeImages` still pads to 224. The recorded resolution is the camera frame, not 256×256.
 
@@ -69,7 +72,7 @@ Next to `pi05_pretrain_human300` in `third_party/openpi/src/openpi/training/conf
 
 - `Pi0Config(pi05=True, action_horizon=50, action_dim=32)` with `discrete_state_input=True`.
 - Point the dataset root at the copied `piper_finetune` folder.
-- A sample is still the current state and this one image. The action window is `range(0, 50)` inside the same episode. Do not append the next episode. Repeating the last action to fill 50 steps can stay; those repeated steps enter the existing flow-matching loss. This dataset has no `action_is_pad`.
+- A sample is still the current state and these two images. The action window is `range(0, 50)` inside the same episode. Do not append the next episode. Repeating the last action to fill 50 steps can stay; those repeated steps enter the existing flow-matching loss. This dataset has no `action_is_pad`.
 - Name the config `pi05_piper_finetune`.
 
 Save the fine-tuned checkpoint in a new directory. Do not overwrite the `checkpoint_dir` that `pi05_pretrain_human300` uses now. After training, point `policy_config` and `checkpoint_dir` in the collection computer's `team_config.json` at the new config and the new directory.

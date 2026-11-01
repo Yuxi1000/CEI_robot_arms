@@ -1,8 +1,15 @@
+# Never commit anything recorded or captured on this machine.
 episodes/
 datasets/
+_camera_test/
+_camera_test*/
+_can_listen_log.txt
+
+# Local machine state.
 .venv/
 __pycache__/
-_camera_test/
-_can_listen_log.txt
 piper_link_state.json
+
+# Holds this machine's account, host and checkpoint; the empty template is
+# team_config.example.json.
 team_config.json

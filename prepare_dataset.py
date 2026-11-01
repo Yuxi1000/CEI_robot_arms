@@ -2,8 +2,10 @@
 
 The vectors are already in the model order used by pi05_pretrain_human300.
 The server must not apply the Panda-Omron Groot reorder on top of them.
-One Astra Pro video is stored. The other two camera slots stay empty;
-the server masks those slots. See 服务器训练对接.md.
+Two D405 videos are stored: ``observation.images.agentview_left`` (third view)
+and ``observation.images.wrist_left`` (wrist). The server maps them to
+``base_0_rgb`` and ``left_wrist_0_rgb`` and masks ``right_wrist_0_rgb``.
+See 服务器训练对接.md.
 
     python prepare_dataset.py
     python prepare_dataset.py --self-check
@@ -22,11 +24,15 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from dataset_export import COLLECTION_MODES, CONTROL_DT_S, GRIPPER_CLOSE_MM, _quat_from_matrix
+from dataset_export import COLLECTION_MODES, CONTROL_DT_S, GRIPPER_CLOSE_MM, WRIST_IMAGES, _quat_from_matrix
 from policy_step import euler_to_matrix
 
 DEST_DIR = Path("datasets") / "piper_finetune"
+# The server maps these two keys to base_0_rgb and left_wrist_0_rgb. If the
+# training config names the wrist stream differently, change it here only.
 VIDEO_KEY = "observation.images.agentview_left"
+WRIST_VIDEO_KEY = "observation.images.wrist_left"
+VIDEO_KEYS = (VIDEO_KEY, WRIST_VIDEO_KEY)
 # Below 0.5 on the training control_mode axis. Confirm this side is arm control
 # in default_pandaomron.json before the fine-tune. The other side is 1.0.
 ARM_CONTROL_MODE = 0.0
@@ -98,12 +104,12 @@ def _pose(row):
     }
 
 
-def _image_file(episode, index, timestamps):
-    if timestamps is not None and "file" in timestamps.columns:
+def _image_file(episode, index, timestamps, column="file", folder="images"):
+    if timestamps is not None and column in timestamps.columns:
         match = timestamps[timestamps["index"] == index]
-        if len(match):
-            return episode / str(match.iloc[0]["file"])
-    return episode / "images" / f"{int(index):06d}.jpg"
+        if len(match) and pd.notna(match.iloc[0][column]):
+            return episode / str(match.iloc[0][column])
+    return episode / folder / f"{int(index):06d}.jpg"
 
 
 def _segments_from_grid(episode, grid, timestamps, task, min_rows):
@@ -111,6 +117,7 @@ def _segments_from_grid(episode, grid, timestamps, task, min_rows):
     states = []
     actions = []
     images = []
+    wrist_images = []
     previous_quat = None
 
     def flush():
@@ -120,6 +127,7 @@ def _segments_from_grid(episode, grid, timestamps, task, min_rows):
             states.clear()
             actions.clear()
             images.clear()
+            wrist_images.clear()
             return
         segments.append(
             {
@@ -128,11 +136,13 @@ def _segments_from_grid(episode, grid, timestamps, task, min_rows):
                 "states": np.stack(states).astype(np.float32),
                 "actions": np.stack(actions).astype(np.float32),
                 "images": list(images),
+                "wrist_images": list(wrist_images),
             }
         )
         states.clear()
         actions.clear()
         images.clear()
+        wrist_images.clear()
 
     for index in range(len(grid) - 1):
         row = grid.iloc[index]
@@ -141,8 +151,14 @@ def _segments_from_grid(episode, grid, timestamps, task, min_rows):
         if blocked or int(row["image_index"]) < 0:
             flush()
             continue
+        # -1 means the take predates the wrist camera, so it cannot join a dual-camera dataset.
+        wrist_index = int(row["wrist_image_index"]) if "wrist_image_index" in row.index else -1
+        if wrist_index < 0:
+            flush()
+            continue
         image = _image_file(episode, int(row["image_index"]), timestamps)
-        if not image.is_file():
+        wrist_image = _image_file(episode, wrist_index, timestamps, "wrist_file", WRIST_IMAGES)
+        if not image.is_file() or not wrist_image.is_file():
             flush()
             continue
         state = piper_train_state(_pose(row), row["gripper_mm"])
@@ -160,6 +176,7 @@ def _segments_from_grid(episode, grid, timestamps, task, min_rows):
         states.append(state)
         actions.append(action)
         images.append(image)
+        wrist_images.append(wrist_image)
     flush()
     return segments
 
@@ -191,14 +208,17 @@ def _episode_dirs(episodes_dir):
     return found
 
 
-def collect_segments(episodes_dir, min_rows):
+def collect_segments(episodes_dir, min_rows, skipped=None):
     segments = []
     for episode, metadata in _episode_dirs(episodes_dir):
         grid = pd.read_parquet(episode / "export" / "grid.parquet")
         timestamps_path = episode / "image_timestamps.parquet"
         timestamps = pd.read_parquet(timestamps_path) if timestamps_path.is_file() else None
         task = str(metadata.get("task_text") or "")
-        segments.extend(_segments_from_grid(episode, grid, timestamps, task, min_rows))
+        found = _segments_from_grid(episode, grid, timestamps, task, min_rows)
+        if not found and skipped is not None:
+            skipped.append(episode.name)
+        segments.extend(found)
     return segments
 
 
@@ -249,19 +269,21 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
     dest = Path(dest)
     if dest.resolve() == episodes_dir.resolve():
         raise RuntimeError("dataset destination must be a different directory from the episodes")
-    segments = collect_segments(episodes_dir, min_rows)
+    skipped = []
+    segments = collect_segments(episodes_dir, min_rows, skipped)
     if not segments:
         raise RuntimeError(
             f"no segment of at least {min_rows} rows under {episodes_dir}. "
-            "Export a successful drag episode first."
+            "Export a successful drag episode first. Every exported episode now needs both camera "
+            f"streams, and {len(skipped)} take(s) recorded before the wrist camera existed were skipped."
         )
     if dest.exists():
         shutil.rmtree(dest)
     data_dir = dest / "data" / "chunk-000"
-    video_dir = dest / "videos" / "chunk-000" / VIDEO_KEY
+    video_root = dest / "videos" / "chunk-000"
     meta_dir = dest / "meta"
     data_dir.mkdir(parents=True)
-    video_dir.mkdir(parents=True)
+    video_root.mkdir(parents=True)
     meta_dir.mkdir(parents=True)
 
     tasks = []
@@ -269,8 +291,8 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
     episodes = []
     state_rows = []
     action_rows = []
-    height = width = None
-    codec = None
+    sizes = {}
+    codecs = {}
     global_index = 0
     for episode_index, segment in enumerate(segments):
         task = segment["task"]
@@ -279,11 +301,15 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
             tasks.append(task)
         task_index = task_to_index[task]
         count = len(segment["images"])
-        frame_height, frame_width, codec = _write_video(video_dir / f"episode_{episode_index:06d}.mp4", segment["images"])
-        if height is None:
-            height, width = frame_height, frame_width
-        elif (frame_height, frame_width) != (height, width):
-            raise RuntimeError(f"image size changed at segment {episode_index}")
+        for video_key, image_paths in ((VIDEO_KEY, segment["images"]), (WRIST_VIDEO_KEY, segment["wrist_images"])):
+            frame_height, frame_width, video_codec = _write_video(
+                video_root / video_key / f"episode_{episode_index:06d}.mp4", image_paths
+            )
+            if video_key not in sizes:
+                sizes[video_key] = (frame_height, frame_width)
+                codecs[video_key] = video_codec
+            elif sizes[video_key] != (frame_height, frame_width):
+                raise RuntimeError(f"image size of {video_key} changed at segment {episode_index}")
         table = pa.table(
             {
                 "observation.state": pa.array(segment["states"].tolist(), type=pa.list_(pa.float32(), 16)),
@@ -322,9 +348,24 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
         "already_in_model_order": True,
         "state": {name: {"start": index, "end": index + 1} for index, name in enumerate(STATE_NAMES)},
         "action": {name: {"start": index, "end": index + 1} for index, name in enumerate(ACTION_NAMES)},
-        "video": {VIDEO_KEY: {"camera_count": 1, "color": "bgr"}},
+        "video": {key: {"camera_count": 1, "color": "bgr"} for key in VIDEO_KEYS},
     }
     (meta_dir / "modality.json").write_text(json.dumps(modality, indent=2) + "\n", encoding="utf-8")
+    features = {
+        "observation.state": {"dtype": "float32", "shape": [16], "names": list(STATE_NAMES)},
+        "action": {"dtype": "float32", "shape": [12], "names": list(ACTION_NAMES)},
+    }
+    for key in VIDEO_KEYS:
+        features[key] = {
+            "dtype": "video",
+            "shape": [sizes[key][0], sizes[key][1], 3],
+            "names": ["height", "width", "channel"],
+            "info": {
+                "video.codec": codecs[key],
+                "video.fps": int(round(1.0 / CONTROL_DT_S)),
+                "video.pix_fmt": "bgr",
+            },
+        }
     info = {
         "codebase_version": "v2.1",
         "robot_type": "piper",
@@ -335,19 +376,11 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
         "chunks_size": 1000,
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
-        "features": {
-            "observation.state": {"dtype": "float32", "shape": [16], "names": list(STATE_NAMES)},
-            "action": {"dtype": "float32", "shape": [12], "names": list(ACTION_NAMES)},
-            VIDEO_KEY: {
-                "dtype": "video",
-                "shape": [height, width, 3],
-                "names": ["height", "width", "channel"],
-                "info": {"video.codec": codec, "video.fps": int(round(1.0 / CONTROL_DT_S)), "video.pix_fmt": "bgr"},
-            },
-        },
+        "features": features,
         "gripper_close_mm": GRIPPER_CLOSE_MM,
         "arm_control_mode": ARM_CONTROL_MODE,
-        "physical_camera_count": 1,
+        "physical_camera_count": 2,
+        "video_keys": list(VIDEO_KEYS),
         "norm": "z-score, population std, server adds 1e-6",
     }
     (meta_dir / "info.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
@@ -366,7 +399,9 @@ def self_check(root):
     if episode.exists():
         shutil.rmtree(episode)
     images = episode / "images"
+    wrist_images = episode / WRIST_IMAGES
     images.mkdir(parents=True)
+    wrist_images.mkdir(parents=True)
     rows = []
     stamps = []
     # 30 teaching steps closed, 5 steps not teaching, 30 teaching steps open.
@@ -398,7 +433,16 @@ def self_check(root):
             }
         )
         cv2.imwrite(str(images / f"{index:06d}.jpg"), np.full((48, 64, 3), index, dtype=np.uint8))
-        stamps.append({"index": index, "t_image": index * CONTROL_DT_S, "file": f"images/{index:06d}.jpg"})
+        # The wrist frames are offset so a swapped stream shows up in the video check below.
+        cv2.imwrite(str(wrist_images / f"{index:06d}.jpg"), np.full((48, 64, 3), index + 100, dtype=np.uint8))
+        stamps.append(
+            {
+                "index": index,
+                "t_image": index * CONTROL_DT_S,
+                "file": f"images/{index:06d}.jpg",
+                "wrist_file": f"{WRIST_IMAGES}/{index:06d}.jpg",
+            }
+        )
     pd.DataFrame(rows).to_parquet(episode / "robot_feedback.parquet", index=False)
     pd.DataFrame(stamps).to_parquet(episode / "image_timestamps.parquet", index=False)
     (episode / "metadata.json").write_text(
@@ -438,16 +482,19 @@ def self_check(root):
         raise RuntimeError("self-check base pose")
     if abs(float(state[0, 14]) - 0.011) > 1e-5 or abs(float(state[0, 15]) + 0.011) > 1e-5:
         raise RuntimeError(f"self-check fingers {state[0, 14:16]}")
-    capture = cv2.VideoCapture(str(dest / "videos" / "chunk-000" / VIDEO_KEY / "episode_000000.mp4"))
-    frames = 0
-    while True:
-        ok, _frame = capture.read()
-        if not ok:
-            break
-        frames += 1
-    capture.release()
-    if frames != len(first):
-        raise RuntimeError(f"self-check video frames {frames} != rows {len(first)}")
+    for video_key in VIDEO_KEYS:
+        capture = cv2.VideoCapture(str(dest / "videos" / "chunk-000" / video_key / "episode_000000.mp4"))
+        frames = 0
+        while True:
+            ok, _frame = capture.read()
+            if not ok:
+                break
+            frames += 1
+        capture.release()
+        if frames != len(first):
+            raise RuntimeError(f"self-check {video_key} frames {frames} != rows {len(first)}")
+    if info["physical_camera_count"] != 2 or info["video_keys"] != list(VIDEO_KEYS):
+        raise RuntimeError("self-check dual camera metadata")
     print("self-check passed", flush=True)
 
 

@@ -1,5 +1,9 @@
 """Align one recorded episode onto the 0.05 s grid and write 12-d actions.
 
+Both camera streams are resampled onto the same grid: ``images`` (third view) and
+``images_wrist`` (wrist). Episodes recorded before the wrist camera existed have
+no wrist column and still export, with ``wrist_image_index`` set to -1.
+
 The 16-d training state is not written into this grid. prepare_dataset.py builds
 it from the grid. Policy returns are not read as demonstration labels.
 """
@@ -16,12 +20,32 @@ from policy_step import euler_to_matrix
 CONTROL_DT_S = 0.05
 POSITION_SCALE_M = 0.05
 ROTATION_SCALE_RAD = 0.5
+# Episode folders: the third-view frames keep the original path so older takes stay readable.
+THIRD_VIEW_IMAGES = "images"
+WRIST_IMAGES = "images_wrist"
 # A grasp on this gripper sits near 22 mm. 28 mm separates that cluster from the open poses.
 GRIPPER_CLOSE_MM = 28.0
 STALE_S = 0.15
 COLLECTION_MODES = ("drag", "leader_follower")
 # Follower mode while it tracks a leader arm. Read on this arm: 0x2A1 stays CAN_CTRL, MOVE J, teach 0.
 FOLLOWING_MODES = ("CAN_CTRL",)
+# A take whose follower barely moves cannot be a demonstration. This replaces an
+# earlier check on the leader's own commands: a follower that received nothing
+# stands still, and so does an arm that was never dragged with teach on, so the
+# follower's own motion catches both without depending on leader data.
+MIN_PATH_MM = 10.0
+MIN_ROTATION_DEG = 5.0
+# The lead_* columns are recorded for diagnosis only. They are reported here and
+# never gate or label an export.
+LEADER_COLUMNS = (
+    "lead_j1_deg",
+    "lead_j2_deg",
+    "lead_j3_deg",
+    "lead_j4_deg",
+    "lead_j5_deg",
+    "lead_j6_deg",
+    "lead_gripper_mm",
+)
 ACTION_NAMES = (
     "dx_m_over_dt",
     "dy_m_over_dt",
@@ -146,13 +170,71 @@ def _pose_at(feedback, index, grid_time):
     return blended, rotation, ""
 
 
-def _nearest_image(images, grid_time):
-    earlier = images[images["t_image"] <= grid_time]
+def _nearest_image(images, grid_time, column="file", prefix=""):
+    """Index and flag of the newest frame at or before grid_time in one timestamp column.
+
+    ``prefix`` separates the third-view flags from the wrist ones in a row's flag list.
+    """
+    if column not in images.columns:
+        return None, f"missing_{prefix}image"
+    stamped = images[images[column].notna()]
+    earlier = stamped[stamped["t_image"] <= grid_time]
     if earlier.empty:
-        return None, "missing_image"
+        return None, f"missing_{prefix}image"
     row = earlier.iloc[(grid_time - earlier["t_image"]).argmin()]
-    flag = "stale_image" if grid_time - float(row["t_image"]) > STALE_S else ""
+    flag = f"stale_{prefix}image" if grid_time - float(row["t_image"]) > STALE_S else ""
     return int(row["index"]), flag
+
+
+def _has_leader_columns(feedback):
+    return all(column in feedback.columns for column in LEADER_COLUMNS)
+
+
+def leader_command_present(sample):
+    """Whether this follower sample also carries a complete leader command.
+
+    Diagnostic only: nothing in the export path consults it.
+    """
+    return all(np.isfinite(sample[column]) for column in LEADER_COLUMNS)
+
+
+def leader_missing_share(metadata, feedback):
+    """Share of samples without a leader command, for the printed report only.
+
+    Export refuses on the follower's own motion instead, so a take still exports
+    when the lead_* columns are absent or empty as long as the arm really moved.
+    """
+    if _has_leader_columns(feedback):
+        if feedback.empty:
+            return 1.0
+        return float(1.0 - feedback[list(LEADER_COLUMNS)].notna().all(axis=1).mean())
+    samples = int(metadata.get("feedback_samples") or len(feedback) or 0)
+    missing = int(metadata.get("leader_missing") or 0)
+    return float(missing) / max(1, samples)
+
+
+def follower_motion(poses, rotations):
+    """How far the follower itself travelled: the export is a demonstration only if this is not ~0.
+
+    A follower that never received a command stands exactly still, and an arm that was
+    never dragged with teach on does the same, so this one number catches both failures
+    without reading any leader data. Orientation is measured on the rotation matrices so
+    a wrap in a reported Euler angle cannot inflate it.
+    """
+    if len(poses) < 2:
+        return {"path_mm": 0.0, "span_mm": 0.0, "path_deg": 0.0, "gripper_travel_mm": 0.0}
+    positions = np.array([[pose["x_mm"], pose["y_mm"], pose["z_mm"]] for pose in poses], dtype=float)
+    grippers = np.array([pose["gripper_mm"] for pose in poses], dtype=float)
+    angles = []
+    for before, after in zip(rotations[:-1], rotations[1:]):
+        trace = np.clip((np.trace(after @ before.T) - 1.0) / 2.0, -1.0, 1.0)
+        angles.append(float(np.degrees(np.arccos(trace))))
+    return {
+        "path_mm": float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum()),
+        "span_mm": float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0))),
+        "path_deg": float(np.sum(angles)),
+        "gripper_travel_mm": float(np.abs(np.diff(grippers)).sum()),
+    }
 
 
 def _action(current, nxt, current_rotation, next_rotation):
@@ -177,7 +259,16 @@ def demonstrating(collection_mode, ctrl_mode_name, teach_status):
 
 
 def _interval_blocked(start_flags, end_flags):
-    blocked = ("not_teaching", "not_following", "mode_boundary", "missing_image", "stale_image", "position_jump")
+    blocked = (
+        "not_teaching",
+        "not_following",
+        "mode_boundary",
+        "missing_image",
+        "stale_image",
+        "missing_wrist_image",
+        "stale_wrist_image",
+        "position_jump",
+    )
     text = f"{start_flags},{end_flags}"
     return any(flag in text for flag in blocked)
 
@@ -194,6 +285,10 @@ def export_episode(episode_dir):
     images = pd.read_parquet(episode / "image_timestamps.parquet").sort_values("t_image")
     if feedback.empty:
         raise RuntimeError("episode has no arm feedback")
+    # Episodes recorded before the wrist camera was added have no wrist_file column.
+    has_wrist = "wrist_file" in images.columns
+    # Leader columns are recorded by --leader for diagnosis; no export decision reads them.
+    leader_share = leader_missing_share(metadata, feedback)
     times = feedback["t_robot"].to_numpy()
     if np.any(np.diff(times) < -1e-9):
         raise RuntimeError("robot timestamps are not monotonic")
@@ -206,7 +301,10 @@ def export_episode(episode_dir):
         index = max(0, index)
         pose, rotation, pose_flag = _pose_at(feedback, index, grid_time)
         image_index, image_flag = _nearest_image(images, grid_time)
-        flag = ",".join(item for item in (pose_flag, image_flag) if item)
+        wrist_index, wrist_flag = (-1, "")
+        if has_wrist:
+            wrist_index, wrist_flag = _nearest_image(images, grid_time, "wrist_file", "wrist_")
+        flag = ",".join(item for item in (pose_flag, image_flag, wrist_flag) if item)
         sample = feedback.iloc[min(index, len(feedback) - 1)]
         if not demonstrating(collection_mode, sample["ctrl_mode_name"], sample["teach_status"]):
             missing = "not_following" if collection_mode == "leader_follower" else "not_teaching"
@@ -224,6 +322,7 @@ def export_episode(episode_dir):
                 "rz_deg": float(pose["rz_deg"]),
                 "gripper_mm": float(pose["gripper_mm"]),
                 "image_index": -1 if image_index is None else image_index,
+                "wrist_image_index": -1 if wrist_index is None else int(wrist_index),
                 "teach_status": int(sample["teach_status"]),
                 "ctrl_mode_name": sample["ctrl_mode_name"],
                 "flags": flag,
@@ -252,6 +351,14 @@ def export_episode(episode_dir):
             mask[:] = 0
         actions.append(values)
         masks.append(mask)
+    motion = follower_motion(poses, rotations)
+    if motion["path_mm"] < MIN_PATH_MM and motion["path_deg"] < MIN_ROTATION_DEG:
+        raise RuntimeError(
+            f"the follower travelled {motion['path_mm']:.1f} mm and turned {motion['path_deg']:.1f} deg over "
+            f"{len(rows)} samples, which is not a demonstration. Something never moved it: check that teach was "
+            "on for a drag take, or that the leader arm is powered and on the same CAN bus for --leader. "
+            f"(leader_missing_share={leader_share:.2f} is reported for diagnosis only)"
+        )
     table = pd.DataFrame(rows)
     for index, name in enumerate(ACTION_NAMES):
         table[f"action_{index}_{name}"] = [float(item[index]) for item in actions]
@@ -268,13 +375,20 @@ def export_episode(episode_dir):
         "action_source": "measured_trajectory",
         "collection_mode": collection_mode,
         "state_16d": "not in this grid; prepare_dataset.py writes the 16-d training state",
-        "physical_camera_count": 1,
+        "physical_camera_count": 2 if has_wrist else 1,
+        "image_streams": [THIRD_VIEW_IMAGES] + ([WRIST_IMAGES] if has_wrist else []),
         "flagged_rows": int((table["flags"] != "").sum()),
         "grid_rows": int(len(table)),
+        "follower_motion": motion,
+        "leader_missing_share": leader_share,
+        "leader_data": "recorded for diagnosis only; not a label and not a gate",
     }
     (destination / "export_metadata.json").write_text(json.dumps(export_meta, indent=2) + "\n", encoding="utf-8")
     print(
-        f"exported rows={len(table)} flagged={export_meta['flagged_rows']} path={destination / 'grid.parquet'}",
+        f"exported rows={len(table)} flagged={export_meta['flagged_rows']} "
+        f"path_mm={motion['path_mm']:.1f} path_deg={motion['path_deg']:.1f} "
+        f"gripper_travel_mm={motion['gripper_travel_mm']:.1f} leader_missing={leader_share:.2f} "
+        f"path={destination / 'grid.parquet'}",
         flush=True,
     )
     return destination
@@ -373,6 +487,8 @@ def self_check(tmp_dir):
     _self_check_interpolation(root)
     _self_check_not_teaching(root)
     _self_check_leader_follower(root)
+    _self_check_stationary(root)
+    _self_check_no_leader_data(root)
     print("self-check passed", flush=True)
 
 
@@ -458,7 +574,7 @@ def _self_check_not_teaching(root):
     feedback = _feedback_pair(
         [0.0, 0.05],
         [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
-        [(0.0, 0.0, 200.0), (10.0, 0.0, 200.0)],
+        [(0.0, 0.0, 200.0), (40.0, 0.0, 200.0)],
         [80.0, 80.0],
         teach=0,
     )
@@ -477,11 +593,12 @@ def _self_check_leader_follower(root):
         feedback = _feedback_pair(
             [0.0, 0.05],
             [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
-            [(0.0, 0.0, 200.0), (10.0, 0.0, 200.0)],
+            [(0.0, 0.0, 200.0), (40.0, 0.0, 200.0)],
             [80.0, 80.0],
             teach=0,
             mode_name=mode_name,
         )
+        feedback = _with_leader(feedback, missing=False)
         episode = root / f"leader_follower_{mode_name.lower()}"
         _write_synthetic(episode, feedback, 0.05, collection_mode="leader_follower")
         export_episode(episode)
@@ -489,6 +606,60 @@ def _self_check_leader_follower(root):
         masked = any(int(grid.iloc[0][f"mask_{index}"]) for index in range(12))
         if masked != expect_mask:
             raise RuntimeError(f"self-check leader_follower {mode_name} mask {masked}")
+
+
+def _with_leader(feedback, missing):
+    """Add the lead_* columns a --leader recording writes; missing leaves them NaN."""
+    for column in LEADER_COLUMNS:
+        feedback[column] = float("nan") if missing else 0.0
+    return feedback
+
+
+def _self_check_stationary(root):
+    """A take where the follower never moved is refused, whatever the leader did."""
+    for collection_mode, mode_name, teach in (
+        ("leader_follower", "CAN_CTRL", 0),
+        ("drag", None, 1),
+    ):
+        feedback = _feedback_pair(
+            [0.0, 0.05],
+            [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
+            [(0.0, 0.0, 200.0), (0.0, 0.0, 200.0)],
+            [80.0, 80.0],
+            teach=teach,
+            mode_name=mode_name,
+        )
+        feedback = _with_leader(feedback, missing=True)
+        episode = root / f"stationary_{collection_mode}"
+        _write_synthetic(episode, feedback, 0.05, collection_mode=collection_mode)
+        try:
+            export_episode(episode)
+        except RuntimeError as exc:
+            if "not a demonstration" not in str(exc):
+                raise RuntimeError(f"self-check stationary_{collection_mode} raised the wrong error: {exc}") from exc
+            continue
+        raise RuntimeError(f"self-check stationary_{collection_mode} exported a follower that never moved")
+
+
+def _self_check_no_leader_data(root):
+    """Leader columns missing entirely must still export when the follower moved."""
+    feedback = _feedback_pair(
+        [0.0, 0.05],
+        [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
+        [(0.0, 0.0, 200.0), (40.0, 0.0, 200.0)],
+        [80.0, 80.0],
+        teach=0,
+        mode_name="CAN_CTRL",
+    )
+    episode = root / "leader_follower_no_leader_columns"
+    _write_synthetic(episode, feedback, 0.05, collection_mode="leader_follower")
+    export_episode(episode)
+    grid = pd.read_parquet(episode / "export" / "grid.parquet")
+    if any("lead" in column for column in grid.columns):
+        raise RuntimeError("self-check leader columns leaked into the export")
+    masks = [int(grid.iloc[0][f"mask_{index}"]) for index in range(7)]
+    if masks != [1] * 7:
+        raise RuntimeError(f"self-check no_leader_data mask {masks}")
 
 
 def main():
