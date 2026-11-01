@@ -22,7 +22,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from dataset_export import CONTROL_DT_S, GRIPPER_CLOSE_MM, _quat_from_matrix
+from dataset_export import COLLECTION_MODES, CONTROL_DT_S, GRIPPER_CLOSE_MM, _quat_from_matrix
 from policy_step import euler_to_matrix
 
 DEST_DIR = Path("datasets") / "piper_finetune"
@@ -185,7 +185,7 @@ def _episode_dirs(episodes_dir):
         metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         if metadata.get("success") is not True:
             continue
-        if metadata.get("collection_mode") != "drag" or metadata.get("action_source") != "measured_trajectory":
+        if metadata.get("collection_mode") not in COLLECTION_MODES or metadata.get("action_source") != "measured_trajectory":
             continue
         found.append((path, metadata))
     return found

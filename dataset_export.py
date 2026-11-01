@@ -19,6 +19,9 @@ ROTATION_SCALE_RAD = 0.5
 # A grasp on this gripper sits near 22 mm. 28 mm separates that cluster from the open poses.
 GRIPPER_CLOSE_MM = 28.0
 STALE_S = 0.15
+COLLECTION_MODES = ("drag", "leader_follower")
+# Follower mode while it tracks a leader arm. Read on this arm: 0x2A1 stays CAN_CTRL, MOVE J, teach 0.
+FOLLOWING_MODES = ("CAN_CTRL",)
 ACTION_NAMES = (
     "dx_m_over_dt",
     "dy_m_over_dt",
@@ -166,8 +169,15 @@ def _action(current, nxt, current_rotation, next_rotation):
     return values, mask
 
 
+def demonstrating(collection_mode, ctrl_mode_name, teach_status):
+    """Whether a feedback sample is part of the demonstration for this collection mode."""
+    if collection_mode == "leader_follower":
+        return ctrl_mode_name in FOLLOWING_MODES
+    return int(teach_status) == 1 and ctrl_mode_name == "TEACHING"
+
+
 def _interval_blocked(start_flags, end_flags):
-    blocked = ("not_teaching", "mode_boundary", "missing_image", "stale_image", "position_jump")
+    blocked = ("not_teaching", "not_following", "mode_boundary", "missing_image", "stale_image", "position_jump")
     text = f"{start_flags},{end_flags}"
     return any(flag in text for flag in blocked)
 
@@ -175,8 +185,9 @@ def _interval_blocked(start_flags, end_flags):
 def export_episode(episode_dir):
     episode = Path(episode_dir)
     metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
-    if metadata.get("collection_mode") != "drag" or metadata.get("action_source") != "measured_trajectory":
-        raise RuntimeError("export accepts drag episodes whose labels come from the measured trajectory")
+    collection_mode = metadata.get("collection_mode")
+    if collection_mode not in COLLECTION_MODES or metadata.get("action_source") != "measured_trajectory":
+        raise RuntimeError("export accepts drag or leader_follower episodes whose labels come from the measured trajectory")
     if metadata.get("success") is not True:
         raise RuntimeError("export accepts an episode only after it is marked success")
     feedback = pd.read_parquet(episode / "robot_feedback.parquet").sort_values("t_robot")
@@ -197,8 +208,9 @@ def export_episode(episode_dir):
         image_index, image_flag = _nearest_image(images, grid_time)
         flag = ",".join(item for item in (pose_flag, image_flag) if item)
         sample = feedback.iloc[min(index, len(feedback) - 1)]
-        if int(sample["teach_status"]) != 1 or sample["ctrl_mode_name"] != "TEACHING":
-            flag = ",".join(item for item in (flag, "not_teaching") if item)
+        if not demonstrating(collection_mode, sample["ctrl_mode_name"], sample["teach_status"]):
+            missing = "not_following" if collection_mode == "leader_follower" else "not_teaching"
+            flag = ",".join(item for item in (flag, missing) if item)
         poses.append(pose)
         rotations.append(rotation)
         rows.append(
@@ -254,6 +266,7 @@ def export_episode(episode_dir):
         "rotation_scale_rad": ROTATION_SCALE_RAD,
         "gripper_close_mm": GRIPPER_CLOSE_MM,
         "action_source": "measured_trajectory",
+        "collection_mode": collection_mode,
         "state_16d": "not in this grid; prepare_dataset.py writes the 16-d training state",
         "physical_camera_count": 1,
         "flagged_rows": int((table["flags"] != "").sum()),
@@ -359,10 +372,11 @@ def self_check(tmp_dir):
         raise RuntimeError(f"self-check half turn {half_turn}")
     _self_check_interpolation(root)
     _self_check_not_teaching(root)
+    _self_check_leader_follower(root)
     print("self-check passed", flush=True)
 
 
-def _feedback_pair(times, eulers, positions, grippers, teach=1):
+def _feedback_pair(times, eulers, positions, grippers, teach=1, mode_name=None):
     rows = []
     for time_s, euler, position, gripper in zip(times, eulers, positions, grippers):
         rows.append(
@@ -382,7 +396,7 @@ def _feedback_pair(times, eulers, positions, grippers, teach=1):
                 "ry_deg": euler[1],
                 "rz_deg": euler[2],
                 "ctrl_mode": 2 if teach == 1 else 1,
-                "ctrl_mode_name": "TEACHING" if teach == 1 else "CAN_CTRL",
+                "ctrl_mode_name": mode_name or ("TEACHING" if teach == 1 else "CAN_CTRL"),
                 "teach_status": teach,
                 "motion_status": 0,
                 "arm_status": 0,
@@ -392,7 +406,7 @@ def _feedback_pair(times, eulers, positions, grippers, teach=1):
     return pd.DataFrame(rows)
 
 
-def _write_synthetic(episode, feedback, duration):
+def _write_synthetic(episode, feedback, duration, collection_mode="drag"):
     episode.mkdir(parents=True, exist_ok=True)
     (episode / "images").mkdir(exist_ok=True)
     feedback.to_parquet(episode / "robot_feedback.parquet", index=False)
@@ -404,7 +418,7 @@ def _write_synthetic(episode, feedback, duration):
             {
                 "episode_id": episode.name,
                 "task_text": "self-check",
-                "collection_mode": "drag",
+                "collection_mode": collection_mode,
                 "action_source": "measured_trajectory",
                 "success": True,
                 "schema_version": 1,
@@ -455,6 +469,26 @@ def _self_check_not_teaching(root):
     masks = [int(grid.iloc[0][f"mask_{index}"]) for index in range(12)]
     if any(masks):
         raise RuntimeError(f"self-check not_teaching mask {masks}")
+
+
+def _self_check_leader_follower(root):
+    """A following leader_follower sample exports; a STANDBY one is masked."""
+    for mode_name, expect_mask in (("CAN_CTRL", True), ("STANDBY", False)):
+        feedback = _feedback_pair(
+            [0.0, 0.05],
+            [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
+            [(0.0, 0.0, 200.0), (10.0, 0.0, 200.0)],
+            [80.0, 80.0],
+            teach=0,
+            mode_name=mode_name,
+        )
+        episode = root / f"leader_follower_{mode_name.lower()}"
+        _write_synthetic(episode, feedback, 0.05, collection_mode="leader_follower")
+        export_episode(episode)
+        grid = pd.read_parquet(episode / "export" / "grid.parquet")
+        masked = any(int(grid.iloc[0][f"mask_{index}"]) for index in range(12))
+        if masked != expect_mask:
+            raise RuntimeError(f"self-check leader_follower {mode_name} mask {masked}")
 
 
 def main():
