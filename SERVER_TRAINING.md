@@ -60,7 +60,7 @@ Use `meta/stats.json` from this folder. `observation.state` and `action` each ha
 
 ## Images
 
-There are two streams. Feed `observation.images.agentview_left` to `base_0_rgb` and `observation.images.wrist_left` to `left_wrist_0_rgb`. Set `image_mask` false only for `right_wrist_0_rgb`. A missing `observation/right_image` must not raise, and neither frame must be copied into another slot.
+There are two streams. Feed `observation.images.agentview_left` to `base_0_rgb` and `observation.images.wrist_left` to `left_wrist_0_rgb`. Set `image_mask` false only for `right_wrist_0_rgb`. A missing `observation/right_image` must not raise, and neither frame must be copied into another slot. `team_config.py patch-remote` applies exactly that to the checkout's `robocasa_policy.py` (zeros plus a false mask for the missing key).
 
 If the wrist key in this openpi checkout's `LeRobotRobocasaDataConfig.image_keys` is not `observation.images.wrist_left`, change `WRIST_VIDEO_KEY` at the top of `prepare_dataset.py` and repack the dataset instead of writing the name in two places.
 

@@ -18,6 +18,7 @@ import contextlib
 import ctypes
 import os
 import queue
+import re
 import struct
 import sys
 import threading
@@ -519,6 +520,50 @@ def open_bus():
     return can.Bus(interface=interface, channel=channel, bitrate=1_000_000)
 
 
+_FIRMWARE_REQUEST_ID = 0x4AF
+# "S-V1.9-0" and then the serial number. The patch number never has a leading zero,
+# so a leading 0 is the version's own and the digits after it are the serial.
+_FIRMWARE_PATTERN = re.compile(r"S-V(\d+)\.(\d+)-(0|[1-9]\d?)")
+
+
+def _version_from_frames(frames):
+    """'S-V1.9-0' once the raw 0x4AF reply bytes hold a whole version, else None."""
+    text = "".join(chr(byte) if 32 <= byte < 127 else "\0" for byte in frames)
+    match = _FIRMWARE_PATTERN.search(text)
+    if match is None:
+        return None
+    return f"S-V{match.group(1)}.{match.group(2)}-{match.group(3)}"
+
+
+def _firmware_from_raw_bus(seconds=2.5):
+    """Read the software version off the bus frame by frame when the SDK's parse is unusable.
+
+    Two arms on one bus answer every 0x4AF query and the SDK concatenates their
+    frames into one shifted string no version can be read from. The ASCII version
+    survives frame by frame, so ask again here and parse the raw bytes.
+    Returns e.g. 'S-V1.9-0', or None when no reply arrived.
+    """
+    interface, channel = can_args()
+    bus = can.Bus(interface=interface, channel=channel, bitrate=1_000_000)
+    try:
+        bus.send(
+            can.Message(arbitration_id=_FIRMWARE_REQUEST_ID, data=[0x01, 0, 0, 0, 0, 0, 0, 0], is_extended_id=False)
+        )
+        frames = bytearray()
+        deadline = time.perf_counter() + seconds
+        while time.perf_counter() < deadline:
+            message = bus.recv(timeout=0.2)
+            if message is None or message.arbitration_id != _FIRMWARE_REQUEST_ID:
+                continue
+            frames += message.data[: message.dlc]
+            version = _version_from_frames(frames)
+            if version is not None:
+                return version
+        return _version_from_frames(frames)
+    finally:
+        bus.shutdown()
+
+
 def create_piper_arm(firmware="auto", **config):
     """Build a pyAgxArm Piper driver on the right CAN backend. The caller calls connect().
 
@@ -541,14 +586,16 @@ def create_piper_arm(firmware="auto", **config):
             create_agx_arm_config(robot=ArmModel.PIPER, firmeware_version=profile, **config)
         )
 
-    # PIPER_FIRMWARE (default, v183, v188, v189) skips the query.
-    firmware = os.environ.get("PIPER_FIRMWARE", firmware)
+    # PIPER_FIRMWARE (default, v183, v188, v189) skips the query. A blank value is
+    # unset: an empty string in the environment must not be passed to the SDK.
+    firmware = (os.environ.get("PIPER_FIRMWARE") or firmware or "").strip() or "auto"
     if firmware != "auto":
         return build(firmware)
     probe = build("default")
     probe.connect()
     info = None
     profile = None
+    garbled = None
     try:
         # get_firmware() discards the reply until the feedback rate is measured, which takes a moment after connect.
         deadline = time.time() + 2.0
@@ -557,24 +604,53 @@ def create_piper_arm(firmware="auto", **config):
         if probe.get_fps() <= 0:
             # With nothing else on the bus, writes are never acknowledged and time out on USB.
             raise RuntimeError("no CAN frames from the arm: check that it is powered on and its CAN cable reaches this adapter")
-        for _ in range(5):
-            info = probe.get_firmware(timeout=1.5)
-            if not info:
+        for _ in range(8):
+            # A reply left over from the previous try would be spliced onto this one.
+            buffer = getattr(getattr(probe, "_parser", None), "firmware_info", None)
+            if buffer is not None:
+                buffer.msg.clear()
+            candidate = probe.get_firmware(timeout=1.5)
+            if not candidate:
                 continue
+            info = candidate
             try:
-                profile = resolve_firmware_profile(ArmModel.PIPER, info["software_version"])
+                profile = resolve_firmware_profile(ArmModel.PIPER, candidate["software_version"])
                 break
             except ValueError:
-                # Master/slave: both arms answer the query and their multi-frame replies interleave.
-                # Drop the mixed reply so the next query starts clean.
-                probe._parser.firmware_info.msg.clear()
+                # Master/slave: both arms answer the query and their multi-frame replies interleave,
+                # so every attempt comes back mixed. Keep the sample to report it below.
+                garbled = candidate
     finally:
         probe.disconnect()
-    if not info:
-        raise RuntimeError("the arm did not report its firmware version: is it powered and on the bus?")
-    if profile is None:
+    if profile is not None:
+        return build(profile)
+    # A garbled reply means two devices answered the same id. The raw frames are
+    # the same mix, and the first "S-V..." in that mix can be the leader's, so
+    # accepting it would build the follower with the wrong profile. Only a single
+    # silent SDK reply is worth reading off the bus again.
+    version = None
+    if garbled is None:
+        try:
+            version = _firmware_from_raw_bus()
+        except (OSError, can.CanError):
+            version = None
+    if version is not None:
+        try:
+            profile = resolve_firmware_profile(ArmModel.PIPER, version)
+        except ValueError:
+            profile = None
+        if profile is not None:
+            return build(profile)
+    if garbled is not None:
         raise RuntimeError(
-            f"unreadable firmware version {info['software_version']!r}: with a leader arm on the bus both arms answer; "
-            "set PIPER_FIRMWARE to the follower's profile (v189 for S-V1.9-0)"
+            f"unreadable firmware version {garbled['software_version']!r}: a second device answers this query on "
+            "the same bus, which is what a leader arm on the same adapter does. Its multi-frame reply interleaves "
+            "with the follower's, so the version cannot be told apart. Set PIPER_FIRMWARE to the "
+            "follower's profile: default up to S-V1.8-2, v183 for S-V1.8-3..7, v188 for S-V1.8-8, v189 for S-V1.9-0"
         )
-    return build(profile)
+    if not info:
+        raise RuntimeError(
+            "the arm answered the feedback stream but not the firmware query: check that it is powered and that "
+            "its CAN cable reaches this adapter"
+        )
+    raise RuntimeError(f"the arm reported {info!r}, which no firmware profile matches")

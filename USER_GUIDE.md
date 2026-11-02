@@ -2,7 +2,7 @@
 
 This guide is for people operating the arm. To change code, observation fields, or the CAN protocol, read `DEVELOPER_GUIDE.md`. The Chinese version is `用户文档.md`.
 
-What this does: a Windows or Mac computer reads the arm, captures one third-view frame and one wrist frame from two Intel RealSense D405 cameras, sends both as the observation through the local SSH tunnel, and starts the next chunk. Each reply is an end-effector chunk. The computer plays it in the arm base frame, then reads a new state and new frames and requests the next chunk, until you press `Ctrl+C`. Account, code directory, server name, and model name belong in `team_config.json`. This guide does not hard-code them. On a Mac, use `.venv/bin/python` wherever this guide says `python`.
+What this does: a Windows or Mac computer reads the arm, captures one third-view frame and one wrist frame from two Intel RealSense D405 cameras, sends both as the observation through the local SSH tunnel, and starts the next chunk. Each reply is an end-effector chunk. The computer plays it in the arm base frame, then reads a new state and new frames and requests the next chunk, until you press `Ctrl+C`. The cameras, firmware, cluster, and directory layout for this rig are defaults in `team_config.py`. `team_config.json` names the account, the policy config, and the checkpoint. On a Mac, use `.venv/bin/python` wherever this guide says `python`.
 
 ```mermaid
 flowchart LR
@@ -37,14 +37,14 @@ flowchart LR
 - On Windows, close ArmRobot first. While it is open, this computer cannot open the CAN adapter.
 - Power the arm and plug the CAN cable into the arm's CAN port.
 - Run every command in this folder. This folder is wherever you unpacked the code, not someone else's desktop path. On Windows use `python`. On a Mac use `.venv/bin/python`.
-- Put the server account, checkpoint, and SSH alias in `team_config.json` in this same folder. Copy it from `team_config.example.json`; the real file is gitignored because the repository is public. When the machine or account changes, edit that file and generate the commands with `python team_config.py`.
-- `ssh_host` may stay empty. The program then connects with `login_host` and `remote_user`. If you already have a Host in `.ssh\config`, put that Host name in `ssh_host`.
+- Copy `team_config.example.json` to `team_config.json` and fill `remote_user`, `policy_config`, and `checkpoint_dir`. The real file is gitignored because the repository is public. Anything else in that file replaces the matching default; leave a key out to keep the default.
+- The login node is `athena.egr.duke.edu`. Set `ssh_host` only when your `.ssh\config` already has a Host for it. Logs go to `~/logs` and the checkout is `~/skipconnect-pi05-robocasa/third_party/openpi`.
 
 ## On a Mac
 
 Run the one-time setup in the developer guide (`brew install libusb` and the `.venv`, which includes `python-can` and `pyAgxArm`), then use `.venv/bin/python` in place of `python` below. Before the first run:
 
-1. Allow camera access for Terminal (System Settings > Privacy & Security > Camera). Fill `third_view_serial` and `wrist_serial` in `team_config.json`. Confirm the two are not swapped before recording: `python _realsense_test.py` writes labelled pictures to `_camera_test/`, and `policy_link.py cameras --motion-check` reports which camera moves when you move the arm (that one is the wrist view). `policy_link.py preview` shows both streams live (q closes the windows).
+1. Allow camera access for Terminal (System Settings > Privacy & Security > Camera). This rig's `third_view_serial` and `wrist_serial` are already the defaults. Confirm the two are not swapped before recording: `python _realsense_test.py` writes labelled pictures to `_camera_test/`, and `policy_link.py cameras --motion-check` reports which camera moves when you move the arm (that one is the wrist view). `policy_link.py preview` shows both streams live (q closes the windows).
 2. With `server_mode` set to `"simple"`, `.venv/bin/python team_config.py setup-remote` copies the test server to athena once. Fill `slurm_partition` first.
 3. Leave room around the arm. The test server moves the end effector 10 mm along +X and back each chunk and opens or closes the gripper. A chunk farther than `max_chunk_shift_mm` from its start is refused before anything is sent.
 
@@ -82,7 +82,7 @@ Before a first real run, check the link without moving the arm. This sends real 
 .venv/bin/python team_config.py run --server openpi --observe-only --cycles 3
 ```
 
-The arm must not move at all. Each cycle prints one `observation/image` line, one `observation/wrist_image` line with a different mean, `third_vs_wrist_mad` well above 1.0, the decoded `observation/state`, and then the returned chunk: `actions shape=(50, 12)`. A `WARNING` about an all-zero chunk means the server is still the placeholder. A string reply instead of a chunk is the server's own exception text, so it names the observation key it did not like. When that looks right, run the loop for real:
+The arm must not move at all. Each cycle prints one `observation/image` line, one `observation/wrist_image` line with a different mean, `third_vs_wrist_mad` well above 1.0, the decoded `observation/state`, and then the returned chunk: `actions shape=(50, 12)`. A `WARNING` about an all-zero chunk means the server is still the placeholder. A string reply instead of a chunk is the server's own exception text, so it names the observation key it did not like. `observation/right_image is required for pi05` means the checkpoint's adapter is still the three-camera RoboCasa one: this rig has one scene camera and one wrist camera, so run `.venv/bin/python team_config.py patch-remote` once (it changes that one branch to pad and mask `right_wrist_0_rgb`, as the DROID adapter does), then `down` and start the server again. When that looks right, run the loop for real:
 
 ```bash
 .venv/bin/python team_config.py down
@@ -132,13 +132,15 @@ The leader arm and this (follower) arm share one CAN bus and one adapter. Both g
 python collect.py --leader --task "put the pen in the box"
 ```
 
-With the leader on the bus, both arms answer the firmware-version query and the replies interleave, so the program stops with `unreadable firmware version`. Then name the follower's firmware profile before the command: on a Mac or Linux `PIPER_FIRMWARE=v189 .venv/bin/python collect.py --leader ...`, in Windows PowerShell first `$env:PIPER_FIRMWARE="v189"`. `v189` covers S-V1.8-9 and later (this follower runs S-V1.9-0); see `DEVELOPER_GUIDE.md` for the others.
+With the leader on the bus, both arms answer the firmware-version query and the replies interleave, so the version cannot be told apart. The raw frames are the same mix, and the first version string in them can be the leader's, so `create_piper_arm()` does not guess. This follower is `v189`, which is already the default. Set `piper_firmware` in `team_config.json` only for a different arm. `v189` covers S-V1.8-9 and later; see `DEVELOPER_GUIDE.md` for the others.
+
+The other two messages come from the same place: `no CAN frames from the arm` means the adapter sees nothing at all (arm off, or another program holding the adapter), and `the arm answered the feedback stream but not the firmware query` means the frames arrive but the query is never answered.
 
 The program does not move the arm in this mode. Use the leader to bring the follower to the start pose, press Enter to start recording, and finish with the same keys as above. Recording only reads the bus and the two cameras. The leader's commands are stored as well, but they are only a diagnostic: they never become a training label and the export never decides anything from them. `teaching_fraction` is now the share of time the follower is in a following mode and should be close to 1; if it is 0, send that episode's `mode_changes` to whoever maintains the code. What the export does refuse is a take where **the follower itself never moved**: `follower_path_mm` under 10 mm with less than 5° of rotation means nothing ever commanded or dragged the arm, and `episode_check.py` prints that number right after recording. Before inference, unplug the leader (its commands would fight the policy's), set the former leader back to follower mode, and power-cycle it.
 
 ## Run once
 
-Copy `team_config.example.json` to `team_config.json` and fill in the login address, account, code directory, config name, checkpoint directory, port, and also `log_dir`, `slurm_partition`, `slurm_time`, and `slurm_mem`. See what is still empty:
+Copy `team_config.example.json` to `team_config.json` and fill in the account, the policy config, and the checkpoint directory. The cameras, port, partition, and time are already set for this rig. See the merged result:
 
 ```powershell
 python team_config.py show
@@ -245,6 +247,7 @@ Confirm that `python team_config.py down` has finished, then follow this order:
 | The log says `--port` is unrecognized | An older launch script was used | Run `python team_config.py run` again |
 | The log fails while compiling `av` | The wrong Python is being used | The launch command uses `.venv/bin/python`, not `uv run` |
 | The server reports a missing `observation` field | The observation does not match this model | Change `build_observation()` as described in the developer guide, and do not execute the actions |
+| On Windows, red text like `python : waiting state=PENDING` with `NativeCommandError` | This is not a failure. Windows PowerShell 5.1 reports anything a native command writes to stderr as an error record, and `2>&1` in your own command is what routes it there | Drop `2>&1`: `python team_config.py run ... \| Tee-Object -FilePath _camera_test\rollout_log.txt`. The program itself no longer writes to stderr |
 | `timed out in 5.0s` | An older client did not wait long enough for the model | Use the current program; it prints `waiting_for_inference` first |
 | The log shows the job already exited | The server is not still on the compute node | Read the log tail printed by `run`, fix the config, and run `run` again |
 | On Windows, CAN cannot be opened, error 5 | ArmRobot, VMware, or a Python process from an earlier run owns the adapter | Close ArmRobot. If it still fails, unplug and replug the candleLight, then see device ownership in the developer guide |

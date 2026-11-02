@@ -512,6 +512,13 @@ def _control_loop(host, port, worker, cameras, speed, freq, observe_only=False, 
 
 
 def main():
+    # A model server can return any Unicode in an exception string, and a GBK
+    # console would raise UnicodeEncodeError instead of printing it.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("serve", "once", "cameras", "preview", "ready", "home", "replay"))
     parser.add_argument("episode", nargs="?", help="replay: episode folder; default is the newest one in episodes/")

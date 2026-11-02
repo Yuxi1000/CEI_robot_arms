@@ -18,11 +18,13 @@ scripts/serve_policy.py from openpi_dir with openpi_python on a GPU.
 `--server MODE` overrides server_mode for one command, and mode_overrides.MODE
 replaces Slurm keys for that mode (a model needs more memory than the demo).
 
-Account, code directory, and checkpoint stay in team_config.json.
+This rig's cameras, firmware, cluster, and directory layout are DEFAULTS below.
+team_config.json only has to name the account, the policy config, and the checkpoint.
 """
 
 import base64
 import json
+import os
 import shlex
 import socket
 import subprocess
@@ -40,12 +42,55 @@ PLACEHOLDER_PORT = 8765
 WAIT_POLLS = 180
 WAIT_SECONDS = 10
 
+# This arm, these two D405s, and the Athena checkout layout. A key set in
+# team_config.json replaces the default; a blank value does not.
+DEFAULTS = {
+    "server_mode": "openpi",
+    "ssh_host": "",
+    "login_host": "athena.egr.duke.edu",
+    "local_forward_port": 8000,
+    "remote_code_dir": "",
+    "remote_python": "python3",
+    "log_dir": "~/logs",
+    "replay_episode": "",
+    "openpi_dir": "~/skipconnect-pi05-robocasa/third_party/openpi",
+    "openpi_python": "",
+    "slurm_partition": "athena",
+    "slurm_time": "04:00:00",
+    "slurm_gpus": 1,
+    "slurm_cpus": 8,
+    "slurm_mem": "64G",
+    "third_view_serial": "409122270113",
+    "wrist_serial": "230322276409",
+    "piper_firmware": "v189",
+    "max_chunk_shift_mm": 30,
+    "execute_steps": "",
+    "ee_delta_scale": "",
+    "max_chunk_joint_deg": 100,
+    "joint_speed": 60,
+    "workspace_mm": {"x": [], "y": [], "z": []},
+    "mode_overrides": {},
+}
+
+
+def _blank(value):
+    return value in ("", None) or value == [] or value == {}
+
+
+def merge_config(overlay):
+    """Defaults, then every non-blank key from the json file."""
+    config = dict(DEFAULTS)
+    for key, value in overlay.items():
+        if not _blank(value):
+            config[key] = value
+    return config
+
 
 def load():
-    """team_config.json, or the blank example when a fresh clone has not copied it yet."""
+    """team_config.json over the rig defaults, or the example when a fresh clone has neither."""
     path = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_PATH
     with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+        return merge_config(json.load(handle))
 
 
 def require(config, keys):
@@ -117,12 +162,14 @@ def server_launch(config):
         return config["remote_code_dir"], command, False
     require(config, ["openpi_dir", "policy_config", "checkpoint_dir", "local_forward_port"])
     python = remote_quote(config.get("openpi_python") or ".venv/bin/python")
-    # serve_policy.py takes the subcommand first; that is the order the verified job logs use.
+    # serve_policy.py parses with tyro: options bind to the subcommand that precedes
+    # them, so --port is a top-level option and must come before policy:checkpoint.
+    # Placing it after the subcommand makes tyro reject it as misplaced and the job
+    # exits before it ever listens.
     command = (
-        f"{python} scripts/serve_policy.py policy:checkpoint "
+        f"{python} scripts/serve_policy.py --port {port} policy:checkpoint "
         f"--policy.config={shlex.quote(str(config['policy_config']))} "
-        f"--policy.dir={remote_quote(config['checkpoint_dir'])} "
-        f"--port {port}"
+        f"--policy.dir={remote_quote(config['checkpoint_dir'])}"
     )
     return config["openpi_dir"], command, True
 
@@ -225,7 +272,7 @@ fi
 for _ in $(seq 1 {WAIT_POLLS}); do
   line=$(squeue -h -j "$JOB_ID" -o "%T %N" || true)
   if [ -z "$line" ]; then
-    echo "job_ended job=$JOB_ID"
+    echo "job_ended job=$JOB_ID log=$LOG_DIR/serve-policy-$JOB_ID.out"
     tail -n 40 "$LOG_DIR/serve-policy-$JOB_ID.out" || true
     exit 1
   fi
@@ -240,10 +287,13 @@ for _ in $(seq 1 {WAIT_POLLS}); do
     echo "ready job=$JOB_ID node=$node addr=$addr"
     exit 0
   fi
-  echo "waiting state=$state" >&2
+  # Chatter goes to stdout: PowerShell 5.1 turns a native command's stderr into
+  # NativeCommandError records as soon as the pipeline redirects it (2>&1), which
+  # reads like the run failed. parse_ready() only looks for a "ready " line.
+  echo "waiting state=$state"
   sleep {WAIT_SECONDS}
 done
-echo "timeout job=$JOB_ID"
+echo "timeout job=$JOB_ID log=$LOG_DIR/serve-policy-$JOB_ID.out"
 tail -n 40 "$LOG_DIR/serve-policy-$JOB_ID.out" || true
 exit 1
 """
@@ -261,6 +311,21 @@ def parse_ready(output):
     return ready
 
 
+def keep_printing():
+    """Never die on a character the console cannot encode.
+
+    A remote server or model can print any Unicode. On a Chinese Windows console
+    the code page is GBK, and Python raises UnicodeEncodeError instead of showing
+    the line, which hides the very message that explains a failure. Replacing the
+    character keeps GBK-encodable Chinese readable and drops only the rest.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def run_ssh(config, remote):
     print("Connecting to the login node. Type the password in this window; nothing is shown as you type.", flush=True)
     payload = base64.b64encode(remote.encode()).decode()
@@ -270,6 +335,11 @@ def run_ssh(config, remote):
         stdout=subprocess.PIPE,
         stderr=None,
         text=True,
+        # The compute node prints UTF-8. Without this, Windows decodes with the
+        # console code page (GBK on a Chinese locale) and dies on the first
+        # non-ASCII byte, hiding the log tail that explains why a job exited.
+        encoding="utf-8",
+        errors="replace",
     )
     captured = []
     assert process.stdout is not None
@@ -360,7 +430,18 @@ def up(config):
     output = run_ssh(config, remote_up_script(config))
     ready = parse_ready(output)
     if ready is None or not ready.get("addr"):
-        raise SystemExit("The login node did not return a compute-node address. The log above shows why the job exited or timed out.")
+        hint = ""
+        if "Unrecognized or misplaced options" in output:
+            hint = (
+                "\nserve_policy.py rejected an option placement. It is parsed with tyro, where an option "
+                "binds to the subcommand in front of it, so top-level options such as --port must come "
+                "before policy:checkpoint. Run `python team_config.py serve` to see the command this "
+                "build would send, and fix server_launch() before submitting again."
+            )
+        raise SystemExit(
+            "The login node did not return a compute-node address. The log above shows why the job "
+            f"exited or timed out.{hint}"
+        )
     previous_addr = None
     if STATE_PATH.exists():
         try:
@@ -377,7 +458,11 @@ def once(config, extra=()):
         raise SystemExit(f"Local port {port} is not forwarded. Run python team_config.py up first")
     raise SystemExit(
         subprocess.call(
-            [sys.executable, str(ROOT / "policy_link.py"), "once", "--host", "127.0.0.1", "--port", str(port), *extra]
+            [sys.executable, str(ROOT / "policy_link.py"), "once", "--host", "127.0.0.1", "--port", str(port), *extra],
+            # policy_link's own warnings and tracebacks would otherwise reach
+            # stderr, and PowerShell 5.1 reports redirected native stderr as a
+            # NativeCommandError even when the child only logged a warning.
+            stderr=subprocess.STDOUT,
         )
     )
 
@@ -471,9 +556,53 @@ if [ ! -x .venv/bin/python ]; then {shlex.quote(python)} -m venv .venv; fi
     )
 
 
+def remote_patch_script(config):
+    """Ship openpi_patch.py to the login node and run it against openpi_dir.
+
+    The checkout lives on the cluster, and the SSH login is password-only, so the
+    only way to patch it is to send the script over the same session the other
+    commands use: `python team_config.py patch-remote` asks for the password once.
+    """
+    require(config, ["openpi_dir"])
+    source = (ROOT / "openpi_patch.py").read_text(encoding="utf-8").replace("\r\n", "\n")
+    payload = base64.b64encode(source.encode("utf-8")).decode()
+    python = shlex.quote(config.get("remote_python") or "python3")
+    return f"""set -eu
+patch=$(mktemp /tmp/openpi_patch_XXXXXX)
+trap 'rm -f "$patch"' EXIT
+echo {payload} | base64 -d > "$patch"
+{python} "$patch" {remote_quote(config["openpi_dir"])}
+"""
+
+
+def patch_remote(config):
+    print("Patching the remote openpi checkout; the result line says patched, already_patched, missing or no_match.", flush=True)
+    run_ssh(config, remote_patch_script(config))
+    print(
+        "Restart the server for the change to take effect: python team_config.py down, then run again.",
+        flush=True,
+    )
+
+
 def run(config, extra=()):
     up(config)
     once(config, extra)
+
+
+def apply_piper_firmware(config):
+    """Honour an optional piper_firmware in team_config.json by exporting PIPER_FIRMWARE.
+
+    When a leader arm shares the adapter, both arms answer the firmware query and the
+    multi-frame replies interleave into an unreadable version, so the automatic
+    detection in create_piper_arm() cannot run. Naming the follower's profile in the
+    config skips the query for every command that opens the arm, instead of making
+    each operator remember an environment variable per shell.
+    """
+    value = str(config.get("piper_firmware") or "").strip()
+    # A value already in the environment wins, but a blank one does not: it would
+    # block the config and then be handed to the SDK as a profile name.
+    if value and not (os.environ.get("PIPER_FIRMWARE") or "").strip():
+        os.environ["PIPER_FIRMWARE"] = value
 
 
 def show(config):
@@ -483,9 +612,11 @@ def show(config):
 
 
 def main():
+    keep_printing()
     parser = argparse_parser()
     args = parser.parse_args()
     config = with_mode(load(), args.server)
+    apply_piper_firmware(config)
     extra = []
     if args.ready:
         extra.append("--ready")
@@ -515,6 +646,8 @@ def main():
         show(config)
     elif args.mode == "setup-remote":
         setup_remote(config)
+    elif args.mode == "patch-remote":
+        patch_remote(config)
     else:
         raise SystemExit(f"unknown mode {args.mode}")
 
@@ -523,7 +656,7 @@ def argparse_parser():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("run", "up", "once", "down", "arm", "job", "serve", "show", "setup-remote"))
+    parser.add_argument("mode", choices=("run", "up", "once", "down", "arm", "job", "serve", "show", "setup-remote", "patch-remote"))
     parser.add_argument("--server", choices=SERVER_MODES, help="override server_mode in team_config.json for this command")
     parser.add_argument("--ready", action="store_true", help="unfold to the ready pose before the first observation")
     parser.add_argument("--speed", type=int, help="joint speed percent, passed to policy_link.py once")
