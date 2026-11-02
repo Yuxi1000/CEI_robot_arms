@@ -46,7 +46,7 @@ flowchart TB
 | `policy_link.py` | Builds the observation, keeps one WebSocket open, and loops inference. The cameras and CAN writes are not in the same process |
 | `policy_cameras.py` | Both D405 streams, opened once per session and selected by serial from `team_config.json` |
 | `policy_step.py` | Integrates one action chunk into an end-effector trajectory in the base frame and writes it to CAN |
-| `team_config.json` | Login account, SSH alias, checkpoint, and log directory. Copy it from the tracked blank `team_config.example.json`; the real file is gitignored because the repository is public |
+| `team_config.json` | Account, policy config, and checkpoint. Copy it from `team_config.example.json`. Every other key has a default in `DEFAULTS` for this rig; a non-blank value in the file replaces that default. The real file is gitignored because the repository is public |
 | `team_config.py` | `run` submits the job, waits until it listens, opens one local forward, and starts continuous control. `once` starts another round while the forward is up. `down` cancels the job and closes the forward. `job` and `serve` still only print commands |
 | `simple_policy_server.py` | Scripted policy server for testing the link without a model. See [macOS and the simple server](#macos-and-the-simple-server) |
 | `USER_GUIDE.md` | Operating steps |
@@ -205,7 +205,7 @@ python3 -m venv .venv
 .venv/bin/pip install numpy msgpack 'websockets>=13' opencv-python pyrealsense2 pyusb pandas pyarrow python-can "git+https://github.com/agilexrobotics/pyAgxArm.git"
 ```
 
-`policy_cameras.py` addresses both cameras by serial, because the two D405 units are the same model and an OpenCV index or a V4L2 node can point at the other one between runs. `install pyrealsense2` and set `third_view_serial` and `wrist_serial` in `team_config.json`; `camera_serials()` checks both against `rs.context().query_devices()` and refuses an unplugged or duplicated serial.
+`policy_cameras.py` addresses both cameras by serial, because the two D405 units are the same model and an OpenCV index or a V4L2 node can point at the other one between runs. `install pyrealsense2`. `third_view_serial` and `wrist_serial` default to this rig's two D405s; set them in `team_config.json` only to override. `camera_serials()` checks both against `rs.context().query_devices()` and refuses an unplugged or duplicated serial.
 
 **Depth does not name the cameras.** Two D405 units on one hub perturb each other's depth readings, and the median depends on where each unit happens to point, so an earlier build that picked the wrist by "smaller median depth" had the two views swapped. The role now comes from `team_config.json` only, and `python policy_link.py cameras` prints the depth profile as context, never as a verdict. To prove the assignment, use one of these two:
 

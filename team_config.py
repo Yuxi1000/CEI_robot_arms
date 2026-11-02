@@ -18,7 +18,8 @@ scripts/serve_policy.py from openpi_dir with openpi_python on a GPU.
 `--server MODE` overrides server_mode for one command, and mode_overrides.MODE
 replaces Slurm keys for that mode (a model needs more memory than the demo).
 
-Account, code directory, and checkpoint stay in team_config.json.
+This rig's cameras, firmware, cluster, and directory layout are DEFAULTS below.
+team_config.json only has to name the account, the policy config, and the checkpoint.
 """
 
 import base64
@@ -41,12 +42,55 @@ PLACEHOLDER_PORT = 8765
 WAIT_POLLS = 180
 WAIT_SECONDS = 10
 
+# This arm, these two D405s, and the Athena checkout layout. A key set in
+# team_config.json replaces the default; a blank value does not.
+DEFAULTS = {
+    "server_mode": "openpi",
+    "ssh_host": "",
+    "login_host": "athena.egr.duke.edu",
+    "local_forward_port": 8000,
+    "remote_code_dir": "",
+    "remote_python": "python3",
+    "log_dir": "~/logs",
+    "replay_episode": "",
+    "openpi_dir": "~/skipconnect-pi05-robocasa/third_party/openpi",
+    "openpi_python": "",
+    "slurm_partition": "athena",
+    "slurm_time": "04:00:00",
+    "slurm_gpus": 1,
+    "slurm_cpus": 8,
+    "slurm_mem": "64G",
+    "third_view_serial": "409122270113",
+    "wrist_serial": "230322276409",
+    "piper_firmware": "v189",
+    "max_chunk_shift_mm": 30,
+    "execute_steps": "",
+    "ee_delta_scale": "",
+    "max_chunk_joint_deg": 100,
+    "joint_speed": 60,
+    "workspace_mm": {"x": [], "y": [], "z": []},
+    "mode_overrides": {},
+}
+
+
+def _blank(value):
+    return value in ("", None) or value == [] or value == {}
+
+
+def merge_config(overlay):
+    """Defaults, then every non-blank key from the json file."""
+    config = dict(DEFAULTS)
+    for key, value in overlay.items():
+        if not _blank(value):
+            config[key] = value
+    return config
+
 
 def load():
-    """team_config.json, or the blank example when a fresh clone has not copied it yet."""
+    """team_config.json over the rig defaults, or the example when a fresh clone has neither."""
     path = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_PATH
     with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+        return merge_config(json.load(handle))
 
 
 def require(config, keys):

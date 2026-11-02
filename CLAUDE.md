@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 权威文档：`DEVELOPER_GUIDE.md`（协议、契约、设备问题）和 `USER_GUIDE.md`（操作步骤）。中文版 `开发文档.md` / `用户文档.md` 是同内容的翻译——**改动文档时要同时更新中英文两份**。
 
-没有测试套件、没有构建步骤、没有依赖清单文件。运行时依赖：`numpy`、`msgpack`、`websockets>=13`、`opencv-python`（`cv2`）、`pyrealsense2`、`python-can`、官方 `pyAgxArm`（`pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"`），录制/导出还要 `pandas`、`pyarrow`。两台 D405 按序列号识别（`team_config.json` 的 `third_view_serial` / `wrist_serial`），不按 OpenCV 索引，重启后顺序不会变。**深度不能用来认相机**：同型号两台挂在一个集线器上会互相干扰深度，曾经因此把两路标反；角色只来自配置，用 `_realsense_test.py` 的带标签截图或 `cameras --motion-check` 验证。
+没有测试套件、没有构建步骤、没有依赖清单文件。运行时依赖：`numpy`、`msgpack`、`websockets>=13`、`opencv-python`（`cv2`）、`pyrealsense2`、`python-can`、官方 `pyAgxArm`（`pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"`），录制/导出还要 `pandas`、`pyarrow`。两台 D405 按序列号识别（`DEFAULTS` 里的 `third_view_serial` / `wrist_serial`，可在 `team_config.json` 覆盖），不按 OpenCV 索引，重启后顺序不会变。**深度不能用来认相机**：同型号两台挂在一个集线器上会互相干扰深度，曾经因此把两路标反；角色只来自配置，用 `_realsense_test.py` 的带标签截图或 `cameras --motion-check` 验证。
 
 本机可以是 Windows 或 macOS，直连机械臂，经 SSH 隧道连集群上的策略服务器。采集用 `collect.py`。Mac 上命令用 `.venv/bin/python`。
 
