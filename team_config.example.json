@@ -19,6 +19,7 @@
   "slurm_mem": "",
   "third_view_serial": "",
   "wrist_serial": "",
+  "piper_firmware": "",
   "max_chunk_shift_mm": 30,
   "execute_steps": "",
   "ee_delta_scale": "",
