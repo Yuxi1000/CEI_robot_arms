@@ -11,8 +11,18 @@ between runs and silently mismatch the images a checkpoint was trained on.
 
 Only the color streams are opened here; depth is read by `probe_cameras()` when
 the two serials have to be told apart.
+
+On macOS the pip pyrealsense2 (2.56.5) fails with "failed to set power state" and
+crashes, even under sudo, so there the color stream is read through OpenCV's
+AVFoundation backend instead (`camera_backend` in team_config.json). AVFoundation
+knows a camera only by a unique ID built from its USB location, so the configured
+D405 serial is mapped to its USB serial (`camera_usb_serials`), then to the USB
+location through `ioreg`, then to OpenCV's index. That backend has no depth.
 """
 
+import re
+import subprocess
+import sys
 import threading
 import time
 
@@ -31,6 +41,75 @@ WARMUP_FRAMES = 15
 NEAR_MM = 800
 
 ROLE_KEYS = ((THIRD_VIEW, "third_view_serial"), (WRIST, "wrist_serial"))
+# Tail of an AVFoundation unique ID for an Intel (8086) D405 (0b5b); the head is the USB locationID.
+AVF_D405_SUFFIX = "80860b5b"
+# (height, width) of a D405 color frame through AVFoundation.
+AVF_D405_SHAPE = (720, 1280)
+
+
+def camera_backend(config=None):
+    """"realsense" or "avfoundation", from team_config.json or the platform."""
+    if config is None:
+        from team_config import load
+
+        config = load()
+    value = str(config.get("camera_backend") or "").strip().lower()
+    if value in ("realsense", "avfoundation"):
+        return value
+    if value:
+        raise RuntimeError(f"camera_backend={value!r} in team_config.json: use realsense or avfoundation")
+    return "avfoundation" if sys.platform == "darwin" else "realsense"
+
+
+def _usb_serials_by_location():
+    """{USB locationID: USB serial} for every device on the macOS USB tree."""
+    text = subprocess.run(["ioreg", "-p", "IOUSB", "-l", "-w0"], capture_output=True, text=True, check=True).stdout
+    found = {}
+    for block in text.split("+-o ")[1:]:
+        location = re.search(r'"locationID" = (\d+)', block)
+        serial = re.search(r'"USB Serial Number" = "([^"]*)"', block)
+        if location and serial:
+            found[int(location.group(1))] = serial.group(1)
+    return found
+
+
+def _avfoundation_unique_ids():
+    """Unique IDs of the devices OpenCV numbers, in OpenCV's order.
+
+    cap_avfoundation_mac.mm lists devicesWithMediaType: video plus muxed and sorts
+    them by uniqueID (NSString compare, which matches Python's order for these
+    ASCII IDs); the same call is made here so the two lists cannot disagree.
+    """
+    try:
+        import AVFoundation
+    except ImportError as exc:
+        raise RuntimeError(
+            "pyobjc-framework-AVFoundation is missing: pip install pyobjc-framework-AVFoundation "
+            "(the D405 cameras are numbered through it on macOS)"
+        ) from exc
+    devices = list(AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeVideo))
+    devices += list(AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeMuxed))
+    return sorted(str(device.uniqueID()) for device in devices)
+
+
+def avfoundation_d405s():
+    """Each D405 that AVFoundation lists, as {'index', 'usb_serial', 'unique_id'}.
+
+    OpenCV numbers AVFoundation cameras by their position in the sorted list of
+    every device's unique ID, built-in and virtual cameras included.
+    """
+    unique_ids = _avfoundation_unique_ids()
+    try:
+        by_location = _usb_serials_by_location()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"could not read the USB tree with ioreg: {exc}") from exc
+    cameras = []
+    for index, unique_id in enumerate(unique_ids):
+        if not (unique_id.lower().startswith("0x") and unique_id.lower().endswith(AVF_D405_SUFFIX)):
+            continue
+        location = int(unique_id[2 : -len(AVF_D405_SUFFIX)], 16)
+        cameras.append({"index": index, "usb_serial": by_location.get(location, ""), "unique_id": unique_id})
+    return cameras
 
 
 def _realsense():
@@ -70,7 +149,25 @@ def _model_view_bgr(bgr):
 
 
 def realsense_devices():
-    """Every connected RealSense device as {'serial', 'name', 'firmware'}."""
+    """Every connected RealSense device as {'serial', 'name', 'firmware'}.
+
+    With the AVFoundation backend each entry also carries its OpenCV 'index', and a
+    camera missing from `camera_usb_serials` is named "usb:<USB serial>".
+    """
+    from team_config import load
+
+    config = load()
+    if camera_backend(config) == "avfoundation":
+        by_usb = {str(usb): str(serial) for serial, usb in (config.get("camera_usb_serials") or {}).items()}
+        return [
+            {
+                "serial": by_usb.get(camera["usb_serial"], f"usb:{camera['usb_serial']}"),
+                "name": "RealSense D405 (AVFoundation)",
+                "firmware": "",
+                "index": camera["index"],
+            }
+            for camera in avfoundation_d405s()
+        ]
     rs = _realsense()
     devices = []
 
@@ -99,7 +196,10 @@ def depth_profile_mm(serial):
     away from the arm and sees nothing that close. The nearest percentile separates
     the two; the median does not, because a wrist camera pointed at the far wall or
     parked over the floor can read metres while the third view reads a near table.
+    The AVFoundation backend has no depth and returns None.
     """
+    if camera_backend() == "avfoundation":
+        return None
     rs = _realsense()
     config = rs.config()
     config.enable_device(serial)
@@ -130,12 +230,12 @@ def depth_profile_mm(serial):
         pipeline.stop()
 
 
-def camera_serials():
+def camera_serials(devices=None):
     """{'third_view': serial, 'wrist': serial} from team_config.json, checked against what is plugged in."""
     from team_config import load
 
     config = load()
-    connected = {entry["serial"] for entry in realsense_devices()}
+    connected = {entry["serial"] for entry in (realsense_devices() if devices is None else devices)}
     available = ", ".join(sorted(connected)) or "none"
     mapping = {}
     for name, key in ROLE_KEYS:
@@ -230,6 +330,30 @@ def motion_check():
         print("team_config.json agrees", flush=True)
 
 
+def _avfoundation_frame(image):
+    """AVFoundation's 1280x720 D405 frame cut to the 640x480 the RealSense path delivers.
+
+    The centre is cropped to 4:3 before scaling, so frames keep the shape of the
+    RealSense recordings (prepare_dataset needs one size); the field of view is the
+    16:9 sensor's centre, which may differ slightly from the SDK's 640x480 mode.
+    """
+    import cv2
+
+    height, width = image.shape[:2]
+    target = CAMERA_WIDTH / CAMERA_HEIGHT
+    if width / height > target:
+        keep = int(round(height * target))
+        x0 = (width - keep) // 2
+        image = image[:, x0 : x0 + keep]
+    elif width / height < target:
+        keep = int(round(width / target))
+        y0 = (height - keep) // 2
+        image = image[y0 : y0 + keep]
+    if image.shape[:2] != (CAMERA_HEIGHT, CAMERA_WIDTH):
+        image = cv2.resize(image, (CAMERA_WIDTH, CAMERA_HEIGHT), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(image)
+
+
 class _CameraStream:
     """One D405 color stream whose reader thread keeps only the newest frame.
 
@@ -237,10 +361,13 @@ class _CameraStream:
     the whole session and the caller takes the frame captured after it asked.
     """
 
-    def __init__(self, name, serial):
+    def __init__(self, name, serial, index=None):
         self.name = name
         self.serial = serial
+        # OpenCV's AVFoundation index; None on the RealSense backend.
+        self.index = index
         self._pipeline = None
+        self._capture = None
         self._frame = None
         self._stamp = 0.0
         self._count = 0
@@ -249,42 +376,89 @@ class _CameraStream:
         self._thread = None
 
     def start(self):
-        rs = _realsense()
-        config = rs.config()
-        config.enable_device(self.serial)
-        config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
-        pipeline = rs.pipeline()
-        pipeline.start(config)
-        self._pipeline = pipeline
+        if self.index is not None:
+            self._start_avfoundation()
+        else:
+            rs = _realsense()
+            config = rs.config()
+            config.enable_device(self.serial)
+            config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
+            pipeline = rs.pipeline()
+            pipeline.start(config)
+            self._pipeline = pipeline
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def _start_avfoundation(self):
+        import cv2
+
+        where = f"{self.name} camera (serial {self.serial}, OpenCV index {self.index})"
+        capture = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
+        if not capture.isOpened():
+            capture.release()
+            raise RuntimeError(
+                f"{where} did not open: allow camera access for the app running Python (System Settings > "
+                "Privacy & Security > Camera), and close any other program using the camera"
+            )
+        # A D405 delivers 1280x720 here. Anything else means the index points at
+        # another camera (built-in, iPhone, virtual), whose frames would otherwise
+        # be cropped to 640x480 and pass unnoticed.
+        deadline = time.perf_counter() + 5.0
+        ok, first = False, None
+        while not ok and time.perf_counter() < deadline:
+            ok, first = capture.read()
+        if not ok or first is None or first.shape[:2] != AVF_D405_SHAPE:
+            capture.release()
+            got = "no frame" if not ok or first is None else f"{first.shape[1]}x{first.shape[0]}"
+            raise RuntimeError(f"{where} gave {got}, not a D405's 1280x720: it is not the camera it should be")
+        self._capture = capture
+
     def stop(self):
         self._running = False
         if self._thread is not None:
+            # The reader thread releases its VideoCapture itself, so a read still
+            # running after this timeout never races a release.
             self._thread.join(timeout=2.0)
             self._thread = None
+        elif self._capture is not None:
+            self._capture.release()
+            self._capture = None
         if self._pipeline is not None:
             self._pipeline.stop()
             self._pipeline = None
 
+    def _next_image(self):
+        """One BGR frame, or None after a dropped read."""
+        if self._capture is not None:
+            ok, image = self._capture.read()
+            return _avfoundation_frame(image) if ok else None
+        try:
+            frames = self._pipeline.wait_for_frames(timeout_ms=2000)
+        except RuntimeError:
+            # A dropped frameset is not fatal; the next call usually succeeds.
+            return None
+        frame = frames.get_color_frame()
+        if not frame:
+            return None
+        # copy(): the SDK reuses its buffer, so this view must not be kept.
+        return np.asanyarray(frame.get_data()).copy()
+
     def _run(self):
-        while self._running:
-            try:
-                frames = self._pipeline.wait_for_frames(timeout_ms=2000)
-            except RuntimeError:
-                # A dropped frameset is not fatal; the next call usually succeeds.
-                continue
-            frame = frames.get_color_frame()
-            if not frame:
-                continue
-            # copy(): the SDK reuses its buffer, so this view must not be kept.
-            image = np.asanyarray(frame.get_data()).copy()
-            with self._lock:
-                self._frame = image
-                self._stamp = time.perf_counter()
-                self._count += 1
+        try:
+            while self._running:
+                image = self._next_image()
+                if image is None:
+                    time.sleep(0.005)
+                    continue
+                with self._lock:
+                    self._frame = image
+                    self._stamp = time.perf_counter()
+                    self._count += 1
+        finally:
+            if self._capture is not None:
+                self._capture.release()
+                self._capture = None
 
     def read(self, timeout=3.0):
         """The first frame captured after this call, so it shows the arm where it is now."""
@@ -307,13 +481,37 @@ class PolicyCameras:
     """Both D405 color streams kept open for a whole session, keyed by role."""
 
     def __init__(self, mapping=None):
-        self._mapping = dict(mapping or camera_serials())
+        # One enumeration serves both the serial check and the AVFoundation indices.
+        self._devices = realsense_devices()
+        self._mapping = dict(mapping or camera_serials(self._devices))
         self._streams = {}
+
+    def _indices(self):
+        """{role: OpenCV index} on the AVFoundation backend, else {role: None}."""
+        if camera_backend() != "avfoundation":
+            return {name: None for name in CAMERA_NAMES}
+        if not self._devices:
+            raise RuntimeError(
+                "AVFoundation lists no D405: check the USB cable and hub, and that no other program holds the cameras"
+            )
+        by_serial = {entry["serial"]: entry["index"] for entry in self._devices}
+        indices = {name: by_serial.get(self._mapping[name]) for name in CAMERA_NAMES}
+        missing = [name for name, index in indices.items() if index is None]
+        if missing:
+            listed = ", ".join(by_serial) or "none"
+            raise RuntimeError(
+                f"{', '.join(missing)} camera is not among the D405s AVFoundation lists ({listed}). "
+                "A new camera needs its serial -> USB serial pair in camera_usb_serials."
+            )
+        if indices[THIRD_VIEW] == indices[WRIST]:
+            raise RuntimeError(f"both roles map to OpenCV index {indices[THIRD_VIEW]}")
+        return indices
 
     def __enter__(self):
         try:
+            indices = self._indices()
             for name in CAMERA_NAMES:
-                stream = _CameraStream(name, self._mapping[name])
+                stream = _CameraStream(name, self._mapping[name], indices[name])
                 stream.start()
                 self._streams[name] = stream
             # Wait out the warm-up here so the first observation is not a dark frame.
@@ -380,6 +578,48 @@ def preview():
                     break
         finally:
             cv2.destroyAllWindows()
+
+
+VIDEO_FPS = 20
+
+
+class PacedVideo:
+    """An mp4 that plays back in real time however unevenly frames are offered.
+
+    offer() writes the view once per elapsed 1/fps tick, repeating it when the
+    caller fell behind and skipping it when the caller is faster, so a 30 s replay
+    is a 30 s video. H.264 (avc1) when OpenCV can write it, which QuickTime plays.
+    """
+
+    def __init__(self, path, fps=VIDEO_FPS):
+        self.path = str(path)
+        self.fps = fps
+        self._writer = None
+        self._next = None
+
+    def offer(self, view, now=None):
+        import cv2
+
+        now = time.perf_counter() if now is None else now
+        if self._writer is None:
+            size = (view.shape[1], view.shape[0])
+            for codec in ("avc1", "mp4v"):
+                writer = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*codec), self.fps, size)
+                if writer.isOpened():
+                    self._writer = writer
+                    break
+                writer.release()
+            else:
+                raise RuntimeError(f"OpenCV cannot write {self.path}")
+            self._next = now
+        while now >= self._next:
+            self._writer.write(view)
+            self._next += 1.0 / self.fps
+
+    def close(self):
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
 
 
 def side_by_side(frames, labels=None):

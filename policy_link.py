@@ -27,6 +27,7 @@ from policy_cameras import (
     IMAGE_SHAPE,
     THIRD_VIEW,
     WRIST,
+    PacedVideo,
     PolicyCameras,
     model_image,
     motion_check,
@@ -230,8 +231,13 @@ class MotionWorker:
             raise RuntimeError("motion process failed:\n" + value)
         return status, value
 
-    def read_state(self):
-        return self._call("state")[1]
+    def read_state(self, timeout=None):
+        """PiperClient.read_state(); timeout=None keeps its default wait for complete feedback."""
+        return self._call("state", *(() if timeout is None else (timeout,)))[1]
+
+    def gripper_max_mm(self):
+        """PiperClient.gripper_max_mm(): the gripper's full opening, 70 or 100 mm."""
+        return self._call("gripper_max")[1]
 
     def apply(self, actions, action_space="ee_delta", speed=None, freq=None):
         """Play one chunk. Returns False when a limit check refused it and nothing was sent."""
@@ -312,7 +318,7 @@ def has_display():
     return not sys.platform.startswith("linux") or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def replay_episode(path, speed=None, freq=None, loop=False, preview=True):
+def replay_episode(path, speed=None, freq=None, loop=False, preview=True, video_path=None):
     """Play one drag-teach episode on the arm, without a policy server.
 
     Unfolds to the ready pose (where episode_recorder.py starts a take), plays
@@ -320,14 +326,16 @@ def replay_episode(path, speed=None, freq=None, loop=False, preview=True):
     then returns to the ready pose for the next take. With loop, starts again
     from the ready pose until Ctrl+C. Ctrl+C stops where the arm is. With
     preview, a window shows the camera live; the camera is not otherwise used.
+    video_path also saves that window as an mp4 (needs preview and a display).
     """
     from simple_policy_server import CHUNK_STEPS, Replay, episode_rows
 
     print(f"episode={path}", flush=True)
-    rows = episode_rows(path)
     status = {"text": "ready"}
 
     def play(worker):
+        # The gripper targets are fractions of this arm's own stroke (70 or 100 mm).
+        rows = episode_rows(path, worker.gripper_max_mm())
         go_ready(speed=speed, freq=freq, worker=worker)
         passes = 1
         replay = Replay(rows, CHUNK_STEPS, loop=False)
@@ -354,7 +362,7 @@ def replay_episode(path, speed=None, freq=None, loop=False, preview=True):
     with MotionWorker() as worker:
         try:
             if preview and has_display():
-                _with_camera_window(lambda: play(worker), status)
+                _with_camera_window(lambda: play(worker), status, video_path)
             else:
                 play(worker)
         except KeyboardInterrupt:
@@ -362,8 +370,11 @@ def replay_episode(path, speed=None, freq=None, loop=False, preview=True):
             print("stopped", flush=True)
 
 
-def _with_camera_window(task, status):
-    """Run task in a thread while this (main) thread shows the cameras; macOS draws windows only from the main thread."""
+def _with_camera_window(task, status, video_path=None):
+    """Run task in a thread while this (main) thread shows the cameras; macOS draws windows only from the main thread.
+
+    With video_path the window is also written to that mp4 in real time.
+    """
     import threading
 
     import cv2
@@ -374,6 +385,7 @@ def _with_camera_window(task, status):
         print(f"preview off: {exc}", flush=True)
         task()
         return
+    video = PacedVideo(video_path) if video_path else None
     outcome = {}
 
     def run():
@@ -392,10 +404,20 @@ def _with_camera_window(task, status):
                 view = side_by_side(frames, (THIRD_VIEW, WRIST))
                 cv2.putText(view, status["text"], (10, view.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow(title, view)
+                if video is not None:
+                    try:
+                        video.offer(view)
+                    except RuntimeError as exc:  # never let the video stop a replay midway
+                        print(f"video off: {exc}", flush=True)
+                        video.close()
+                        video = None
             cv2.waitKey(30)
     finally:
         cameras.__exit__(None, None, None)
         cv2.destroyAllWindows()
+        if video is not None:
+            video.close()
+            print(f"video={video_path}", flush=True)
     if "error" in outcome:
         raise outcome["error"]
 

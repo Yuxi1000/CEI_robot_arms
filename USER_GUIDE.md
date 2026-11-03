@@ -64,13 +64,13 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 .venv/bin/python policy_link.py replay episodes/episode_...
 ```
 
-Without a folder it plays the newest recording. No server is needed. A window shows the camera live (`--no-preview` hides it; over SSH there is no window). The arm unfolds to the ready pose (where every recording starts), moves slowly to the recording's first pose, plays it once, prints `replay_done`, and returns to the ready pose. Add `--loop` to keep replaying it, back through the ready pose each time, until `Ctrl+C`. The gripper only fully closes or fully opens: once the recording closed it by about a third of its widest opening, replay closes it to 0 mm (stopping on the object). Joints dragged past their limits (J5 beyond 70 degrees) are held at the limit. Leave drag-teach first. Recordings made on a Mac replay the same on Linux: copy the episode folder over.
+Without a folder it plays the newest recording. No server is needed. A window shows the camera live (`--no-preview` hides it; over SSH there is no window). The arm unfolds to the ready pose (where every recording starts), moves slowly to the recording's first pose, plays it once, prints `replay_done`, and returns to the ready pose. Add `--loop` to keep replaying it, back through the ready pose each time, until `Ctrl+C`. The gripper follows the recording, 10% of its full stroke narrower than recorded so it still grips (stopping on the object), and opens fully wherever the recording was more than 75% open; the stroke is read from this arm. Joints dragged past their limits (J5 beyond 70 degrees) are held at the limit. Leave drag-teach first. Recordings made on a Mac replay the same on Linux: copy the episode folder over.
 
 ### Replay a recording from the server
 
 1. Record a demonstration as in [Record a demonstration](#record-a-demonstration). Any episode can be replayed, not only ones marked `s`.
 2. Set `replay_episode` to that folder (for example `episodes/episode_20261019_160000`) and copy it to the server: `.venv/bin/python team_config.py setup-remote`. It uploads the joint angles and gripper as an `.npz`, so the server needs no pandas.
-3. Leave drag-teach, then run `.venv/bin/python team_config.py run --server replay`. The first chunk moves slowly to the recording's first pose; then each chunk plays the next 2.5 s. Parts moved by hand faster than about 48 degrees/s replay slower. The run ends with `server_done`. Add `--loop` to the server command in `team_config.py` to repeat it.
+3. Leave drag-teach, then run `.venv/bin/python team_config.py run --server replay`. The first chunk moves slowly to the recording's first pose; then each chunk plays the next 2.5 s. Parts moved by hand faster than about 48 degrees/s replay slower. The run ends with `server_done`. Add `--loop` to the server command in `team_config.py` to repeat it. The server cannot ask the arm for its gripper stroke, so it uses `gripper_stroke_mm` from `team_config.json` (default 70; set 100 on a 100 mm gripper).
 
 ### Run the model
 
@@ -136,7 +136,23 @@ With the leader on the bus, both arms answer the firmware-version query and the 
 
 The other two messages come from the same place: `no CAN frames from the arm` means the adapter sees nothing at all (arm off, or another program holding the adapter), and `the arm answered the feedback stream but not the firmware query` means the frames arrive but the query is never answered.
 
-The program does not move the arm in this mode. Use the leader to bring the follower to the start pose, press Enter to start recording, and finish with the same keys as above. Recording only reads the bus and the two cameras. The leader's commands are stored as well, but they are only a diagnostic: they never become a training label and the export never decides anything from them. `teaching_fraction` is now the share of time the follower is in a following mode and should be close to 1; if it is 0, send that episode's `mode_changes` to whoever maintains the code. What the export does refuse is a take where **the follower itself never moved**: `follower_path_mm` under 10 mm with less than 5° of rotation means nothing ever commanded or dragged the arm, and `episode_check.py` prints that number right after recording. Before inference, unplug the leader (its commands would fight the policy's), set the former leader back to follower mode, and power-cycle it.
+The program does not move the arm in this mode. Use the leader to bring the follower to the start pose, press Enter to start recording, and finish with the same keys as above. Recording only reads the bus and the two cameras. The leader's commands are stored as well, but they are only a diagnostic (leader firmware 2.0.7 no longer sends 0x155–0x157/0x159, so the `lead_*` columns stay NaN and `leader_missing_share` is 1.0; that is expected): they never become a training label and the export never decides anything from them. `teaching_fraction` is now the share of time the follower is in a following mode and should be close to 1; if it is 0, send that episode's `mode_changes` to whoever maintains the code. What the export does refuse is a take where **the follower itself never moved**: `follower_path_mm` under 10 mm with less than 5° of rotation means nothing ever commanded or dragged the arm, and `episode_check.py` prints that number right after recording. Before inference, unplug the leader (its commands would fight the policy's), set the former leader back to follower mode, and power-cycle it.
+
+### Demo window
+
+`demo.py` puts everything above in one window, for showing the rig. Power on the follower first, then the leader, then run (on a Mac `.venv/bin/python`):
+
+```bash
+python demo.py --task "put the pen into the box"
+```
+
+No `sudo` is needed. The window shows the third view and the wrist view side by side and the follower's mode, joints and gripper. While the leader is on, the follower follows it; that is the arms' own firmware, the program sends nothing. The program cannot see the leader: on leader firmware 2.0.7 it no longer broadcasts the 0x155–0x157 joint frames (it drives the follower with 0x1C0–0x1C3, which this code does not interpret), so you confirm the leader's power yourself. Keys:
+
+- `r` records one leader/follower take like `collect.py --leader` (s success, f failure, d discard). Both views are saved side by side as `recording.mp4` in the episode folder. A success is checked, exported, and packed into `datasets/piper_finetune`; a take in which the follower never moved is refused there. The `lead_*` columns stay empty with this leader firmware; they are only a diagnostic.
+- `p` replays the newest successful take on the follower only, like `policy_link.py replay`: ready pose, the take, ready pose. The window first asks you to **power the leader off** and press `y` (any other key cancels). The cameras during the replay are saved as `replay_YYYYmmdd_HHMMSS.mp4` in the same episode folder. Before powering the leader on again, pose it near the follower's ready pose, because the follower jumps to the leader's pose at once.
+- `q` or Esc quits.
+
+Recording and replay open the cameras and the arm themselves, so the live window closes while they run and comes back afterwards.
 
 ## Run once
 

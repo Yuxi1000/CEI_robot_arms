@@ -567,8 +567,9 @@ def _firmware_from_raw_bus(seconds=2.5):
 def create_piper_arm(firmware="auto", **config):
     """Build a pyAgxArm Piper driver on the right CAN backend. The caller calls connect().
 
-    firmware="auto" asks the arm for its firmware version (a query, no motion)
-    and picks the matching driver profile; pass a PiperFW value to skip it.
+    The profile comes from PIPER_FIRMWARE, else `firmware`, else team_config.json
+    piper_firmware. Only when none is set ("auto") does it ask the arm for its firmware
+    version (a query, no motion) and pick the matching driver profile.
     """
     from pyAgxArm import AgxArmFactory, ArmModel, create_agx_arm_config, resolve_firmware_profile
 
@@ -588,7 +589,16 @@ def create_piper_arm(firmware="auto", **config):
 
     # PIPER_FIRMWARE (default, v183, v188, v189) skips the query. A blank value is
     # unset: an empty string in the environment must not be passed to the SDK.
-    firmware = (os.environ.get("PIPER_FIRMWARE") or firmware or "").strip() or "auto"
+    firmware = (os.environ.get("PIPER_FIRMWARE") or "").strip() or firmware or "auto"
+    if firmware == "auto":
+        # Every entry point (demo.py, collect.py, policy_link.py ...) opens the arm here,
+        # not only team_config.py, and with a leader on the bus the query cannot be read.
+        try:
+            from team_config import load
+
+            firmware = str(load().get("piper_firmware") or "").strip() or "auto"
+        except (ImportError, OSError, ValueError):
+            firmware = "auto"
     if firmware != "auto":
         return build(firmware)
     probe = build("default")
