@@ -30,6 +30,7 @@ flowchart LR
 | Look up an error | [When something fails](#when-something-fails) |
 | Pause this run, or stop the server | [Stop this test](#stop-this-test) |
 | Record a demonstration by dragging the arm | [Record a demonstration](#record-a-demonstration) |
+| Train and run a ten-take pi0.5 baseline | [Baseline: ten demonstrations to a pi0.5 check](#baseline-ten-demonstrations-to-a-pi05-check) |
 | Power off the arm after use | [After you finish](#after-you-finish) |
 
 ## Before you start
@@ -153,6 +154,39 @@ No `sudo` is needed. The window shows the third view and the wrist view side by 
 - `q` or Esc quits.
 
 Recording and replay open the cameras and the arm themselves, so the live window closes while they run and comes back afterwards.
+
+### Baseline: ten demonstrations to a pi0.5 check
+
+About 10 successful leader/follower takes only prove the pipeline: the data loads, the loss falls, and the arm moves the right way. A usable policy needs dozens to hundreds of takes with the pen and the box in varied positions.
+
+**Record** into a folder of its own (on Windows `python`):
+
+```bash
+.venv/bin/python demo.py --out episodes/baseline_10
+```
+
+Only `episode_*` folders directly under `--out` are read, so older takes in `episodes/` are not mixed in. After each `s`, `datasets/piper_finetune` is rebuilt from that folder alone and replaces whatever was there before. Keep only `s` takes. Start each take near the same pose and vary where the pen and the box sit.
+
+**Check** the count in `datasets/piper_finetune/meta/info.json`: `total_episodes` counts one dataset episode per contiguous valid segment, so it can be larger than the number of takes. Read the `episode_check.py` output printed after each take. To see that a take replays, press `p` in the same demo window (leader powered off); it plays the newest success under `--out`.
+
+**Archive.** `episodes/` and `datasets/` are gitignored and never committed. Copy both to the team OneDrive folder "CEI Robotics data" under a date folder such as `11_03/`, with `episodes/` and `datasets/` inside it.
+
+**Train.** Copy only `datasets/piper_finetune` to the cluster and follow [SERVER_TRAINING.md](SERVER_TRAINING.md): config `pi05_piper_finetune` with `Pi0Config(pi05=True, action_horizon=50, action_dim=32, discrete_state_input=True)`, skip the Panda reorder (`already_in_model_order`), normalize with `meta/stats.json`, feed the two image keys, and save to a new checkpoint directory. These server-side changes are not in this repository. Start training with openpi's own entry point as a Slurm GPU job:
+
+```bash
+uv run scripts/train.py pi05_piper_finetune --exp-name=baseline10 --overwrite
+```
+
+A few thousand steps are enough to see the loss fall.
+
+**Run it.** Set `policy_config` and `checkpoint_dir` in `team_config.json` to the new config and checkpoint, unplug the leader, set the former leader back to follower mode, and power-cycle it (see "Record with a leader arm" above). Check the link first (expect `actions shape=(50, 12)` and no motion), then `once --ready` runs the policy on the same server and moves the arm:
+
+```bash
+.venv/bin/python team_config.py run --server openpi --observe-only --cycles 3
+.venv/bin/python team_config.py once --ready
+```
+
+Keep `execute_steps` and `ee_delta_scale` small. `check_limits()` refuses any chunk outside `max_chunk_shift_mm` or `workspace_mm` and prints `chunk_refused`.
 
 ## Run once
 

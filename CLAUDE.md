@@ -25,7 +25,7 @@ python team_config.py job|serve # 仅打印手动启动服务器的命令
 python team_config.py setup-remote  # server_mode=simple：把测试服务器拷到 remote_code_dir 并建 venv
 python simple_policy_server.py --port 8000 [--mode demo|nudge|replay --episode F]  # 脚本化测试策略，默认关节 demo
 python episode_recorder.py --task "..."  # 先自动移到 READY_DEG，再拖动示教录制（相机+反馈，实时预览窗口），s/f/d 结束；--no-ready/--no-preview
-python demo.py [--task "..."]    # 演示窗口：两路相机 + 从臂状态；r 主从录制（回到起点自动停并响一声，s 存 / d 删；存 recording.mp4），p 确认主臂断电后只在从臂回放最新成功录制（存 replay_*.mp4），q 退出
+python demo.py [--task "..."] [--out DIR]  # 演示窗口：两路相机 + 从臂状态；r 主从录制（s/f/d 结束，存 recording.mp4；--out 默认 episodes），p 确认主臂断电后只在从臂回放最新成功录制（存 replay_*.mp4），q 退出
 python collect.py --leader --task "..."  # 主从遥操作录制：从臂跟随同一总线上的主臂，不动臂，另存 lead_* 列
 python policy_link.py replay [episodes/episode_...] [--loop]  # --loop 一直重复直到 Ctrl+C； 本机回放一条（默认最新），前后都到 READY_DEG，不需要服务器，相机只做预览窗口（会动臂）
 python episode_check.py episodes/episode_...   # 时间线和曲线检查
