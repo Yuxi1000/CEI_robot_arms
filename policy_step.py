@@ -297,7 +297,9 @@ def serve_motion():
                     break
                 try:
                     if request[0] == "state":
-                        reply = ("ok", robot.read_state())
+                        reply = ("ok", robot.read_state(*request[1:]))
+                    elif request[0] == "gripper_max":
+                        reply = ("ok", robot.gripper_max_mm())
                     elif request[0] == "joints":
                         _kind, actions, speed, freq = request
                         apply_joint_actions(robot, actions, speed=speed, update_hz=freq)

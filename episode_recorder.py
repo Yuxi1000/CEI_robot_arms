@@ -29,7 +29,7 @@ import cv2
 import pandas as pd
 
 from piper_client import PiperClient
-from policy_cameras import THIRD_VIEW, WRIST, PolicyCameras, side_by_side
+from policy_cameras import THIRD_VIEW, WRIST, PacedVideo, PolicyCameras, camera_backend, side_by_side
 from policy_link import has_display
 
 SCHEMA_VERSION = 1
@@ -172,6 +172,34 @@ def _show_preview(frames, elapsed, count):
     return chr(code).lower() if code != 0xFF else None
 
 
+def write_episode_video(episode, path=None):
+    """Both recorded views side by side as an mp4 in real time; returns its path, or None without frames."""
+    episode = Path(episode)
+    table = episode / "image_timestamps.parquet"
+    if not table.exists():
+        return None
+    table = pd.read_parquet(table)
+    if table.empty or "t_image" not in table.columns:
+        return None
+    rows = table.sort_values("t_image").to_dict("records")
+    path = Path(path) if path is not None else episode / "recording.mp4"
+    video = PacedVideo(path)
+    wrote = False
+    try:
+        for row in rows:
+            frames = {
+                THIRD_VIEW: cv2.imread(str(episode / row["file"])),
+                WRIST: cv2.imread(str(episode / row["wrist_file"])),
+            }
+            if any(frame is None for frame in frames.values()):
+                continue
+            video.offer(side_by_side(frames, (THIRD_VIEW, WRIST)), row["t_image"])
+            wrote = True
+    finally:
+        video.close()
+    return path if wrote else None
+
+
 def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
     """Record one episode. leader=True records master/slave teleoperation: this arm is the follower and the
     leader's broadcast commands are stored in lead_* columns. Either way this program only reads the bus."""
@@ -208,6 +236,8 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
         "schema_version": SCHEMA_VERSION,
         "physical_camera_count": 2,
         "cameras": {THIRD_VIEW: cameras.mapping[THIRD_VIEW], WRIST: cameras.mapping[WRIST]},
+        # "avfoundation" frames are the 16:9 sensor's centre cropped to 4:3, not the SDK's 640x480 mode.
+        "camera_backend": camera_backend(),
         "color_order": "bgr",
         "length_unit": "mm",
         "angle_unit": "deg",

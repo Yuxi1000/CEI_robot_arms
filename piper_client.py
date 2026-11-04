@@ -207,7 +207,7 @@ class PiperClient:
             if reply is not None and round(reply.msg.max_range_config * 1000) in (70, 100):
                 self._gripper_max = float(round(reply.msg.max_range_config * 1000))
             else:
-                return 70.0
+                self._gripper_max = 70.0  # cached too, so one connection never mixes strokes
         return self._gripper_max
 
     def move_gripper(self, target_mm, effort=1000, timeout=4.0, tolerance_mm=1.0):

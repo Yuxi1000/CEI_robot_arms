@@ -100,9 +100,26 @@ def demo_chunk(cycle, joints):
 
 # Same step length as policy_step.STEP_SECONDS; this file runs on the server without policy_step.
 STEP_SECONDS = 0.05
-# Replay closes the gripper fully once the recording has closed it by this fraction of its widest opening.
-# A grasp stops on the object (about 20 mm on a pen out of 100 mm), so a fixed few-mm threshold never fires.
-GRIPPER_CLOSED_FRACTION = 0.3
+# Replay commands the gripper this share of the stroke narrower than the recording (7 mm on a
+# 70 mm stroke). A grasp's recorded width is where the object stopped the jaws (about 11 mm on a
+# pen); commanding that width would only touch the object, while a target inside it keeps
+# squeezing. Open widths replay that much narrower too.
+GRIPPER_SQUEEZE_FRACTION = 0.1
+# A recorded width above this share of the stroke replays as fully open.
+GRIPPER_FULL_OPEN_FRACTION = 0.75
+# Gripper stroke assumed when the replay cannot ask the arm (a server has no gripper to query).
+GRIPPER_STROKE_MM = 70.0
+
+
+def gripper_commands(width_mm, stroke_mm=GRIPPER_STROKE_MM):
+    """Column 6 for a replay: the recorded width less GRIPPER_SQUEEZE_FRACTION of the stroke, or fully open above
+    GRIPPER_FULL_OPEN_FRACTION of the stroke, as a closing fraction of the stroke
+    (0 = open to stroke_mm, 1 = closed to 0 mm)."""
+    stroke_mm = float(stroke_mm)
+    width_mm = np.asarray(width_mm, dtype=float)
+    target = np.clip(width_mm - GRIPPER_SQUEEZE_FRACTION * stroke_mm, 0.0, stroke_mm)
+    target = np.where(width_mm > GRIPPER_FULL_OPEN_FRACTION * stroke_mm, stroke_mm, target)
+    return 1.0 - target / stroke_mm
 
 
 def episode_arrays(path):
@@ -130,11 +147,12 @@ def write_replay_npz(episode_dir, destination):
     np.savez(destination, joints_deg=joints.astype(np.float32), gripper_mm=gripper.astype(np.float32), t=stamps.astype(np.float32))
 
 
-def episode_rows(path):
+def episode_rows(path, stroke_mm=GRIPPER_STROKE_MM):
     """Resample a recording onto 0.05 s steps. Returns (N, 7) joint targets plus gripper.
 
     Steps that move a joint more than PEAK_STEP_DEG (the hand moved faster than
     the 3 deg/step cap allows) are split, so those parts replay slower.
+    stroke_mm is the gripper's full opening (PiperClient.gripper_max_mm()).
     """
     joints, gripper, stamps = episode_arrays(path)
     grid = np.arange(stamps[0], stamps[-1] + 1e-9, STEP_SECONDS)
@@ -146,15 +164,13 @@ def episode_rows(path):
         joints_out = ", ".join(f"J{i + 1}" for i in np.flatnonzero(outside.any(axis=0)))
         print(f"clamped {int(outside.any(axis=1).sum())} steps to joint limits ({joints_out})", flush=True)
         resampled = np.clip(resampled, limits[:, 0], limits[:, 1])
-    # Column 6 is 1 (close to 0 mm) or 0 (open fully), never in between.
-    widest = max(float(np.max(gripper)), 1.0)
-    closed = (np.interp(grid, stamps, gripper) <= widest * (1.0 - GRIPPER_CLOSED_FRACTION)).astype(float)
-    rows = [np.concatenate([resampled[0], [closed[0]]])]
+    grip = gripper_commands(np.interp(grid, stamps, gripper), stroke_mm)
+    rows = [np.concatenate([resampled[0], [grip[0]]])]
     for index in range(1, len(grid)):
         previous = rows[-1][:6]
         pieces = max(1, int(np.ceil(np.max(np.abs(resampled[index] - previous)) / PEAK_STEP_DEG)))
         for piece in range(1, pieces + 1):
-            rows.append(np.concatenate([previous + (resampled[index] - previous) * piece / pieces, [closed[index]]]))
+            rows.append(np.concatenate([previous + (resampled[index] - previous) * piece / pieces, [grip[index]]]))
     return np.asarray(rows, dtype=np.float32)
 
 
@@ -237,12 +253,14 @@ def main():
     parser.add_argument("--episode", help="episode folder from episode_recorder.py, or its replay .npz, for --mode replay")
     parser.add_argument("--chunk", type=int, default=50, help="replay steps per reply (0.05 s each)")
     parser.add_argument("--loop", action="store_true", help="replay: start over instead of finishing")
+    parser.add_argument("--gripper-stroke-mm", type=float, default=GRIPPER_STROKE_MM,
+                        help="replay: the arm's full gripper stroke (70 or 100)")
     args = parser.parse_args()
     rows = None
     if args.mode == "replay":
         if not args.episode:
             parser.error("--mode replay needs --episode")
-        rows = episode_rows(Path(args.episode))
+        rows = episode_rows(Path(args.episode), args.gripper_stroke_mm)
         print(f"episode={args.episode} steps={len(rows)} seconds={len(rows) * STEP_SECONDS:.1f}", flush=True)
 
     def handler(websocket):

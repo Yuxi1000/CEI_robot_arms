@@ -53,6 +53,7 @@ DEFAULTS = {
     "remote_python": "python3",
     "log_dir": "~/logs",
     "replay_episode": "",
+    "gripper_stroke_mm": 70,
     "openpi_dir": "~/skipconnect-pi05-robocasa/third_party/openpi",
     "openpi_python": "",
     "slurm_partition": "athena",
@@ -62,6 +63,11 @@ DEFAULTS = {
     "slurm_mem": "64G",
     "third_view_serial": "409122270113",
     "wrist_serial": "230322276409",
+    # "" picks pyrealsense2, or OpenCV/AVFoundation on macOS; "realsense" or "avfoundation" forces one.
+    "camera_backend": "",
+    # D405 serial -> its USB (ASIC) serial, which is all macOS shows of a camera.
+    # `sudo rs-enumerate-devices` prints both as "Serial Number" and "Asic Serial Number".
+    "camera_usb_serials": {"409122270113": "254723074040", "230322276409": "410743070181"},
     "piper_firmware": "v189",
     "max_chunk_shift_mm": 30,
     "execute_steps": "",
@@ -159,6 +165,7 @@ def server_launch(config):
         command = f".venv/bin/python simple_policy_server.py --port {port}"
         if mode == "replay":
             command += f" --mode replay --episode {shlex.quote(remote_episode(config))}"
+            command += f" --gripper-stroke-mm {float(config.get('gripper_stroke_mm') or 70)}"
         return config["remote_code_dir"], command, False
     require(config, ["openpi_dir", "policy_config", "checkpoint_dir", "local_forward_port"])
     python = remote_quote(config.get("openpi_python") or ".venv/bin/python")
