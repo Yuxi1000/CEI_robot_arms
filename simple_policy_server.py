@@ -177,7 +177,9 @@ def episode_rows(path, stroke_mm=GRIPPER_STROKE_MM):
 class Replay:
     """Hands out one recording chunk per observation, bridging from wherever the arm is."""
 
-    def __init__(self, rows, chunk_steps, loop):
+    def __init__(self, rows, chunk_steps, loop, continuous=False):
+        # continuous: the caller sends chunks back to back, so only the first one needs a bridge.
+        self.continuous = continuous
         self.rows = rows
         self.chunk_steps = chunk_steps
         self.loop = loop
@@ -195,6 +197,8 @@ class Replay:
         self.position += len(piece)
         name = f"replay pass={self.passes} steps={start}-{self.position}/{len(self.rows)}"
         first = piece[0]
+        if self.continuous and start > 0:
+            return name, piece
         if np.max(np.abs(first[:6] - np.asarray(joints, dtype=float))) <= PEAK_STEP_DEG:
             return name, piece
         # Arm is away from the recording (first chunk, a loop restart, or lag): move there slowly first.

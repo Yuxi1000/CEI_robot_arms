@@ -239,11 +239,14 @@ class MotionWorker:
         """PiperClient.gripper_max_mm(): the gripper's full opening, 70 or 100 mm."""
         return self._call("gripper_max")[1]
 
-    def apply(self, actions, action_space="ee_delta", speed=None, freq=None):
-        """Play one chunk. Returns False when a limit check refused it and nothing was sent."""
+    def apply(self, actions, action_space="ee_delta", speed=None, freq=None, follows=None):
+        """Play one chunk. Returns False when a limit check refused it and nothing was sent.
+
+        follows: see policy_step.apply_joint_actions.
+        """
         actions = np.asarray(actions)
         if action_space == "joints":
-            return self._call("joints", actions, speed, freq)[0] == "ok"
+            return self._call("joints", actions, speed, freq, follows)[0] == "ok"
         return self._call("ee_delta", actions)[0] == "ok"
 
 
@@ -321,10 +324,11 @@ def has_display():
 def replay_episode(path, speed=None, freq=None, loop=False, preview=True, video_path=None):
     """Play one drag-teach episode on the arm, without a policy server.
 
-    Unfolds to the ready pose (where episode_recorder.py starts a take), plays
-    the recording in 2.5 s chunks like `simple_policy_server.py --mode replay`,
-    then returns to the ready pose for the next take. With loop, starts again
-    from the ready pose until Ctrl+C. Ctrl+C stops where the arm is. With
+    Moves slowly to the recording's first frame, plays the recording in 2.5 s
+    chunks like `simple_policy_server.py --mode replay`, and stays on its last
+    frame. A detour through the ready pose would add a move and a gripper opening
+    the take does not have. With loop, starts again from the first frame until
+    Ctrl+C. Ctrl+C stops where the arm is. With
     preview, a window shows the camera live; the camera is not otherwise used.
     video_path also saves that window as an mp4 (needs preview and a display).
     """
@@ -336,9 +340,9 @@ def replay_episode(path, speed=None, freq=None, loop=False, preview=True, video_
     def play(worker):
         # The gripper targets are fractions of this arm's own stroke (70 or 100 mm).
         rows = episode_rows(path, worker.gripper_max_mm())
-        go_ready(speed=speed, freq=freq, worker=worker)
         passes = 1
-        replay = Replay(rows, CHUNK_STEPS, loop=False)
+        replay = Replay(rows, CHUNK_STEPS, loop=False, continuous=True)
+        follows = None
         while True:
             state = worker.read_state()
             if not state["complete"]:
@@ -347,17 +351,18 @@ def replay_episode(path, speed=None, freq=None, loop=False, preview=True, video_
             if actions is None:
                 print(f"replay_done pass={passes}", flush=True)
                 status["text"] = "ready"
-                go_ready(speed=speed, freq=freq, worker=worker)
                 if not loop:
                     return
                 passes += 1
-                replay = Replay(rows, CHUNK_STEPS, loop=False)
+                replay = Replay(rows, CHUNK_STEPS, loop=False, continuous=True)
                 replay.passes = passes
+                follows = None
                 continue
             print(name, flush=True)
             status["text"] = name
-            if not worker.apply(actions, "joints", speed=speed, freq=freq):
+            if not worker.apply(actions, "joints", speed=speed, freq=freq, follows=follows):
                 raise RuntimeError(f"chunk refused during {name}")
+            follows = actions[-1, :6]
 
     with MotionWorker() as worker:
         try:
@@ -548,7 +553,7 @@ def main():
     parser.add_argument("--freq", type=float, help="joint target updates per second; 20 holds one target per step; default 100")
     parser.add_argument("--ready", action="store_true", help="once: unfold to the ready pose before the first observation")
     parser.add_argument("--no-preview", action="store_true", help="replay: no camera window")
-    parser.add_argument("--loop", action="store_true", help="replay: play the episode again and again, through the ready pose, until Ctrl+C")
+    parser.add_argument("--loop", action="store_true", help="replay: play the episode again and again until Ctrl+C")
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int)
     parser.add_argument(

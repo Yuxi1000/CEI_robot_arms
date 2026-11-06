@@ -51,6 +51,8 @@ AVF_D405_SUFFIX = "80860b5b"
 AVF_D405_SHAPE = (720, 1280)
 # A role value naming a webcam by USB vendor + product, the tail of its AVFoundation unique ID.
 UVC_PREFIX = "uvc:"
+# third_view_camera / wrist_camera in team_config.json pick one of these; "d405", or blank, uses the role's serial.
+CAMERA_BRANDS = {"logitech": "uvc:046d0843", "orbbec": "uvc:2bc50501"}
 
 
 def camera_backend(config=None):
@@ -116,6 +118,18 @@ def avfoundation_d405s():
         location = int(unique_id[2 : -len(AVF_D405_SUFFIX)], 16)
         cameras.append({"index": index, "usb_serial": by_location.get(location, ""), "unique_id": unique_id})
     return cameras
+
+
+def role_camera(config, name, key):
+    """The camera value of one role: its brand's tag, or its serial when the brand is d405 or blank."""
+    brand = str(config.get(f"{name}_camera") or "").strip().lower()
+    if brand in CAMERA_BRANDS:
+        return CAMERA_BRANDS[brand]
+    if brand not in ("", "d405"):
+        choices = ", ".join(("d405", *CAMERA_BRANDS))
+        raise RuntimeError(f"{name}_camera={brand!r} in team_config.json: use one of {choices}")
+    value = config.get(key)
+    return str(value).strip() if value not in ("", None) else ""
 
 
 def avfoundation_uvc(tag):
@@ -188,8 +202,8 @@ def realsense_devices():
             }
             for camera in avfoundation_d405s()
         ]
-        for _, key in ROLE_KEYS:
-            value = str(config.get(key) or "").strip()
+        for name, key in ROLE_KEYS:
+            value = role_camera(config, name, key)
             if value.startswith(UVC_PREFIX):
                 index = avfoundation_uvc(value[len(UVC_PREFIX) :])
                 if index is not None:
@@ -266,8 +280,7 @@ def camera_serials(devices=None):
     available = ", ".join(sorted(connected)) or "none"
     mapping = {}
     for name, key in ROLE_KEYS:
-        value = config.get(key)
-        value = str(value).strip() if value not in ("", None) else ""
+        value = role_camera(config, name, key)
         if not value:
             raise RuntimeError(
                 f"set {key} in team_config.json. Connected D405 serials: {available} "
@@ -388,9 +401,11 @@ class _CameraStream:
     the whole session and the caller takes the frame captured after it asked.
     """
 
-    def __init__(self, name, serial, index=None):
+    def __init__(self, name, serial, index=None, controls=None):
         self.name = name
         self.serial = serial
+        # Fixed focus and white balance of a uvc: webcam; see uvc_controls.py.
+        self.controls = controls
         # OpenCV's AVFoundation index; None on the RealSense backend.
         self.index = index
         self._pipeline = None
@@ -444,6 +459,17 @@ class _CameraStream:
             raise RuntimeError(
                 f"{where} gave {first.shape[1]}x{first.shape[0]}, not a D405's 1280x720: it is not the camera it should be"
             )
+        if self.controls:
+            if not self.serial.startswith(UVC_PREFIX):
+                capture.release()
+                raise RuntimeError(f"{self.name}_controls in team_config.json needs a logitech or orbbec camera")
+            from uvc_controls import apply_controls
+
+            try:
+                apply_controls(self.serial[len(UVC_PREFIX) :], self.controls)
+            except RuntimeError:
+                capture.release()
+                raise
         self._capture = capture
 
     def stop(self):
@@ -517,6 +543,10 @@ class PolicyCameras:
         self._devices = realsense_devices()
         self._mapping = dict(mapping or camera_serials(self._devices))
         self._streams = {}
+        from team_config import load
+
+        config = load()
+        self.controls = {name: dict(config.get(f"{name}_controls") or {}) for name in CAMERA_NAMES}
 
     def _indices(self):
         """{role: OpenCV index} on the AVFoundation backend, else {role: None}."""
@@ -543,13 +573,13 @@ class PolicyCameras:
         try:
             indices = self._indices()
             for name in CAMERA_NAMES:
-                stream = _CameraStream(name, self._mapping[name], indices[name])
+                stream = _CameraStream(name, self._mapping[name], indices[name], self.controls[name])
                 stream.start()
                 self._streams[name] = stream
             # Wait out the warm-up here so the first observation is not a dark frame.
             for name in CAMERA_NAMES:
                 self._streams[name].read()
-        except Exception:
+        except BaseException:
             self.close()
             raise
         print(

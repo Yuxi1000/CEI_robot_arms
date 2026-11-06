@@ -27,7 +27,7 @@ def newest_episode(out_dir):
     return max(candidates, key=lambda path: path.name)
 
 
-def finish_episode(episode, episodes_root):
+def finish_episode(episode, episodes_root, dest=None):
     from dataset_export import export_episode
     from episode_check import check_episode
     from prepare_dataset import build_dataset
@@ -39,7 +39,10 @@ def finish_episode(episode, episodes_root):
         print(f"not exported success={metadata.get('success')} episode={episode}", flush=True)
         return
     export_episode(episode)
-    build_dataset(episodes_root)
+    if dest is None:
+        build_dataset(episodes_root)
+    else:
+        build_dataset(episodes_root, dest)
 
 
 def main():

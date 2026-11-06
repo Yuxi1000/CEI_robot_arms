@@ -31,6 +31,7 @@ flowchart LR
 | Pause this run, or stop the server | [Stop this test](#stop-this-test) |
 | Record a demonstration by dragging the arm | [Record a demonstration](#record-a-demonstration) |
 | Train and run a ten-take pi0.5 baseline | [Baseline: ten demonstrations to a pi0.5 check](#baseline-ten-demonstrations-to-a-pi05-check) |
+| Run the three-strip pointing experiment | [Pointing experiment: three strips](#pointing-experiment-three-strips) |
 | Power off the arm after use | [After you finish](#after-you-finish) |
 
 ## Before you start
@@ -65,7 +66,7 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 .venv/bin/python policy_link.py replay episodes/episode_...
 ```
 
-Without a folder it plays the newest recording. No server is needed. A window shows the camera live (`--no-preview` hides it; over SSH there is no window). The arm unfolds to the ready pose (where every recording starts), moves slowly to the recording's first pose, plays it once, prints `replay_done`, and returns to the ready pose. Add `--loop` to keep replaying it, back through the ready pose each time, until `Ctrl+C`. The gripper follows the recording, 10% of its full stroke narrower than recorded so it still grips (stopping on the object), and opens fully wherever the recording was more than 75% open; the stroke is read from this arm. Joints dragged past their limits (J5 beyond 70 degrees) are held at the limit. Leave drag-teach first. Recordings made on a Mac replay the same on Linux: copy the episode folder over.
+Without a folder it plays the newest recording. No server is needed. A window shows the camera live (`--no-preview` hides it; over SSH there is no window). The arm moves slowly from where it is to the recording's first pose, plays it once, prints `replay_done`, and stays on the last pose. Add `--loop` to keep replaying it, back through the first pose each time, until `Ctrl+C`. The gripper follows the recording, 10% of its full stroke narrower than recorded so it still grips (stopping on the object), and opens fully wherever the recording was more than 75% open; the stroke is read from this arm. Joints dragged past their limits (J5 beyond 70 degrees) are held at the limit. Leave drag-teach first. Recordings made on a Mac replay the same on Linux: copy the episode folder over.
 
 ### Replay a recording from the server
 
@@ -147,10 +148,10 @@ The program does not move the arm in this mode. Use the leader to bring the foll
 python demo.py --task "put the pen into the box"
 ```
 
-No `sudo` is needed. The window shows the third view and the wrist view side by side and the follower's mode, joints and gripper. While the leader is on, the follower follows it; that is the arms' own firmware, the program sends nothing. The program cannot see the leader: on leader firmware 2.0.7 it no longer broadcasts the 0x155–0x157 joint frames (it drives the follower with 0x1C0–0x1C3, which this code does not interpret), so you confirm the leader's power yourself. Keys:
+No `sudo` is needed. The window shows the third view and the wrist view side by side and the follower's mode, joints and gripper. While the leader is on, the follower follows it; that is the arms' own firmware, the program sends nothing. The program cannot see the leader: on leader firmware 2.0.7 it no longer broadcasts the 0x155–0x157 joint frames, so you confirm the leader's power yourself: move the leader by hand, and if the follower does not follow, it is off. Keys:
 
 - `r` records one leader/follower take like `collect.py --leader` (s success, f failure, d discard). Both views are saved side by side as `recording.mp4` in the episode folder. A success is checked, exported, and packed into `datasets/piper_finetune`; a take in which the follower never moved is refused there. The `lead_*` columns stay empty with this leader firmware; they are only a diagnostic.
-- `p` replays the newest successful take on the follower only, like `policy_link.py replay`: ready pose, the take, ready pose. The window first asks you to **power the leader off** and press `y` (any other key cancels). The cameras during the replay are saved as `replay_YYYYmmdd_HHMMSS.mp4` in the same episode folder. Before powering the leader on again, pose it near the follower's ready pose, because the follower jumps to the leader's pose at once.
+- `p` replays the newest successful take on the follower only, like `policy_link.py replay`: the take's first pose, then the take. The window first asks you to **power the leader off** and press `y` (any other key cancels). The cameras during the replay are saved as `replay_YYYYmmdd_HHMMSS.mp4` in the same episode folder. Before powering the leader on again, pose it near the follower's ready pose, because the follower jumps to the leader's pose at once.
 - `q` or Esc quits.
 
 Recording and replay open the cameras and the arm themselves, so the live window closes while they run and comes back afterwards.
@@ -187,6 +188,51 @@ A few thousand steps are enough to see the loss fall.
 ```
 
 Keep `execute_steps` and `ee_delta_scale` small. `check_limits()` refuses any chunk outside `max_chunk_shift_mm` or `workspace_mm` and prints `chunk_refused`.
+
+### Pointing experiment: three strips
+
+`pointing.py` is the pointing experiment: a person points at three strips by hand, then the arm does. Both modes start from one window with both cameras, and keys go to that window; `q` or Esc there quits (on a Mac `.venv/bin/python`).
+
+**The policy does not see the human demonstration yet.** It is only saved: nothing reads the order from it or marks the next strip, so the policy cannot follow a shown order.
+
+Pick the camera by brand in `team_config.json`, and fix a webcam's focus and white balance so every take looks the same (macOS, no `sudo`; exposure stays on auto):
+
+```json
+"third_view_camera": "logitech",
+"third_view_controls": {"focus": 30, "white_balance": 3500}
+```
+
+`third_view_camera` takes `logitech`, `orbbec`, or `d405`. If the camera or the lighting moves, check the picture again.
+
+**Collect** with the follower and the leader powered on:
+
+```bash
+python pointing.py collect
+```
+
+`--task`, `--out`, and `--dataset` replace the task sentence and the two folders below. For each take:
+
+- `SPACE` starts the human demonstration. Point at the three strips, then withdraw your hand. `d` here cancels it and leaves nothing.
+- `SPACE` ends it. The cameras and the arm reopen, which takes about two seconds. Wait for `REC` in the window, then move the leader.
+- `s` keeps the take as a success, `f` as a failure, `d` discards it.
+
+The arm part is an ordinary episode under `episodes/pointing`. The human part stays inside that episode in its `human_demo/` folder, with `human_demo.mp4`, and is not trained on. A success is checked, exported, and packed into `datasets/pointing`, a dataset of its own, so `datasets/piper_finetune` is not replaced. As in the demo window, a take in which the follower never moved is refused. SPACE reads the arm first, in both modes: with no feedback the window stays up with a red line, so check the arm's power and the CAN wires and press SPACE again.
+
+**Infer** with the leader powered off, because its commands fight the policy, and the server up. The script stops at once if nothing listens on the local port:
+
+```bash
+python team_config.py up
+python pointing.py infer --observe-only --cycles 3
+python pointing.py infer --ready
+```
+
+The first `infer` line checks the link and sends nothing to the arm. The second moves the arm; `--ready` unfolds it to the ready pose first. `--speed` and `--freq` work as in `policy_link.py once`. For each run:
+
+- `SPACE` starts the human demonstration (`d` cancels it).
+- `SPACE` ends it, once your hand is out, and the policy runs the arm.
+- `Ctrl+C` in the terminal stops the arm and brings the window back.
+
+Each run saves its human demonstration as `episodes/pointing_runs/run_YYYYmmdd_HHMMSS/`, with `human_demo.mp4`. `--task` is sent as the prompt, so it must be the sentence the dataset was trained on; the default is the same in both modes.
 
 ## Run once
 

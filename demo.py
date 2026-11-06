@@ -18,8 +18,8 @@ Keys in the window:
        never moved is refused there.
     p  replay the newest successful episode on the follower only. The window
        first asks you to power the leader off and press y, because its commands
-       would fight the replay. The follower goes to the ready pose, plays the
-       episode, and returns to the ready pose; the cameras during the replay
+       would fight the replay. The follower moves to the episode's first pose,
+       plays it, and stays on its last pose; the cameras during the replay
        are saved as replay_YYYYmmdd_HHMMSS.mp4 in that episode's folder.
     q  quit (Esc too).
 
@@ -56,7 +56,7 @@ def newest_episode(folder):
     return None
 
 
-def _overlay(view, lines):
+def overlay(view, lines):
     """Text lines on a dark band at the bottom of the view."""
     height = 26 * len(lines) + 12
     band = view[-height:]
@@ -98,7 +98,7 @@ def live_view(out_dir):
                     lines.append(("r record (leader on)   p replay newest success (leader off)   q quit", white))
                 if message and now < message_until:
                     lines.append((message, red))
-                cv2.imshow(TITLE, _overlay(view, lines))
+                cv2.imshow(TITLE, overlay(view, lines))
 
             key = cv2.waitKey(30) & 0xFF
             if key == 0xFF:
@@ -159,7 +159,7 @@ def main():
                 print("replaying on the follower; Ctrl+C in this terminal stops it", flush=True)
                 replay_episode(episode, video_path=episode / f"replay_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
                 print(
-                    "replay finished. Before powering the leader on again, pose it near the follower's ready pose: "
+                    "replay finished. Before powering the leader on again, pose it near the follower's current pose: "
                     "the follower moves to the leader's pose at once.",
                     flush=True,
                 )
