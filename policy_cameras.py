@@ -18,6 +18,10 @@ AVFoundation backend instead (`camera_backend` in team_config.json). AVFoundatio
 knows a camera only by a unique ID built from its USB location, so the configured
 D405 serial is mapped to its USB serial (`camera_usb_serials`), then to the USB
 location through `ioreg`, then to OpenCV's index. That backend has no depth.
+
+A role can also name a plain USB webcam on that backend: `uvc:` plus its USB vendor
+and product IDs, for example `uvc:046d0843` for a Logitech C930e. It has no serial
+that AVFoundation shows, so only one camera of that model can be plugged in.
 """
 
 import re
@@ -45,6 +49,8 @@ ROLE_KEYS = ((THIRD_VIEW, "third_view_serial"), (WRIST, "wrist_serial"))
 AVF_D405_SUFFIX = "80860b5b"
 # (height, width) of a D405 color frame through AVFoundation.
 AVF_D405_SHAPE = (720, 1280)
+# A role value naming a webcam by USB vendor + product, the tail of its AVFoundation unique ID.
+UVC_PREFIX = "uvc:"
 
 
 def camera_backend(config=None):
@@ -112,6 +118,19 @@ def avfoundation_d405s():
     return cameras
 
 
+def avfoundation_uvc(tag):
+    """OpenCV index of the one camera whose unique ID ends in tag (USB vendor + product), or None."""
+    tag = tag.lower()
+    found = [
+        index
+        for index, unique_id in enumerate(_avfoundation_unique_ids())
+        if unique_id.lower().startswith("0x") and unique_id.lower().endswith(tag)
+    ]
+    if len(found) > 1:
+        raise RuntimeError(f"{len(found)} cameras match {UVC_PREFIX}{tag}: nothing tells them apart, unplug the extras")
+    return found[0] if found else None
+
+
 def _realsense():
     try:
         import pyrealsense2
@@ -152,14 +171,15 @@ def realsense_devices():
     """Every connected RealSense device as {'serial', 'name', 'firmware'}.
 
     With the AVFoundation backend each entry also carries its OpenCV 'index', and a
-    camera missing from `camera_usb_serials` is named "usb:<USB serial>".
+    camera missing from `camera_usb_serials` is named "usb:<USB serial>". A role
+    set to a `uvc:` webcam is listed too, when it is plugged in.
     """
     from team_config import load
 
     config = load()
     if camera_backend(config) == "avfoundation":
         by_usb = {str(usb): str(serial) for serial, usb in (config.get("camera_usb_serials") or {}).items()}
-        return [
+        cameras = [
             {
                 "serial": by_usb.get(camera["usb_serial"], f"usb:{camera['usb_serial']}"),
                 "name": "RealSense D405 (AVFoundation)",
@@ -168,6 +188,13 @@ def realsense_devices():
             }
             for camera in avfoundation_d405s()
         ]
+        for _, key in ROLE_KEYS:
+            value = str(config.get(key) or "").strip()
+            if value.startswith(UVC_PREFIX):
+                index = avfoundation_uvc(value[len(UVC_PREFIX) :])
+                if index is not None:
+                    cameras.append({"serial": value, "name": "USB webcam (AVFoundation)", "firmware": "", "index": index})
+        return cameras
     rs = _realsense()
     devices = []
 
@@ -331,7 +358,7 @@ def motion_check():
 
 
 def _avfoundation_frame(image):
-    """AVFoundation's 1280x720 D405 frame cut to the 640x480 the RealSense path delivers.
+    """An AVFoundation frame (a D405's 1280x720, or a webcam's) cut to the 640x480 the RealSense path delivers.
 
     The centre is cropped to 4:3 before scaling, so frames keep the shape of the
     RealSense recordings (prepare_dataset needs one size); the field of view is the
@@ -355,7 +382,7 @@ def _avfoundation_frame(image):
 
 
 class _CameraStream:
-    """One D405 color stream whose reader thread keeps only the newest frame.
+    """One color stream whose reader thread keeps only the newest frame.
 
     Opening a pipeline per observation cost about a second, so it stays open for
     the whole session and the caller takes the frame captured after it asked.
@@ -408,10 +435,15 @@ class _CameraStream:
         ok, first = False, None
         while not ok and time.perf_counter() < deadline:
             ok, first = capture.read()
-        if not ok or first is None or first.shape[:2] != AVF_D405_SHAPE:
+        if not ok or first is None:
             capture.release()
-            got = "no frame" if not ok or first is None else f"{first.shape[1]}x{first.shape[0]}"
-            raise RuntimeError(f"{where} gave {got}, not a D405's 1280x720: it is not the camera it should be")
+            raise RuntimeError(f"{where} gave no frame")
+        # A uvc: webcam was already matched by its USB IDs, and its size is its own.
+        if not self.serial.startswith(UVC_PREFIX) and first.shape[:2] != AVF_D405_SHAPE:
+            capture.release()
+            raise RuntimeError(
+                f"{where} gave {first.shape[1]}x{first.shape[0]}, not a D405's 1280x720: it is not the camera it should be"
+            )
         self._capture = capture
 
     def stop(self):
