@@ -277,6 +277,9 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
             "Export a successful drag episode first. Every exported episode now needs both camera "
             f"streams, and {len(skipped)} take(s) recorded before the wrist camera existed were skipped."
         )
+    # Built beside the old dataset and swapped in at the end, so a Ctrl+C leaves that one whole.
+    final = dest
+    dest = final.with_name(final.name + ".building")
     if dest.exists():
         shutil.rmtree(dest)
     data_dir = dest / "data" / "chunk-000"
@@ -384,11 +387,14 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
         "norm": "z-score, population std, server adds 1e-6",
     }
     (meta_dir / "info.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+    if final.exists():
+        shutil.rmtree(final)
+    dest.rename(final)
     print(
-        f"dataset episodes={len(segments)} frames={global_index} path={dest}",
+        f"dataset episodes={len(segments)} frames={global_index} path={final}",
         flush=True,
     )
-    return dest
+    return final
 
 
 def self_check(root):

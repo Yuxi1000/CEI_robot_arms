@@ -214,7 +214,7 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
     robot = PiperClient()
     try:
         robot.connect()
-    except Exception:
+    except BaseException:
         cameras.__exit__(None, None, None)
         raise
 
@@ -238,6 +238,7 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
         "cameras": {THIRD_VIEW: cameras.mapping[THIRD_VIEW], WRIST: cameras.mapping[WRIST]},
         # "avfoundation" frames are the 16:9 sensor's centre cropped to 4:3, not the SDK's 640x480 mode.
         "camera_backend": camera_backend(),
+        "camera_controls": cameras.controls,
         "color_order": "bgr",
         "length_unit": "mm",
         "angle_unit": "deg",

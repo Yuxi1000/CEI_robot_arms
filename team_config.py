@@ -63,6 +63,12 @@ DEFAULTS = {
     "slurm_mem": "64G",
     "third_view_serial": "409122270113",
     "wrist_serial": "230322276409",
+    # Brand per role, macOS only for a webcam: "logitech", "orbbec", or "" / "d405" for the serial above.
+    "third_view_camera": "",
+    "wrist_camera": "",
+    # Fixed settings of a webcam role, such as {"focus": 0, "white_balance": 3500}; {} leaves them on auto.
+    "third_view_controls": {},
+    "wrist_controls": {},
     # "" picks pyrealsense2, or OpenCV/AVFoundation on macOS; "realsense" or "avfoundation" forces one.
     "camera_backend": "",
     # D405 serial -> its USB (ASIC) serial, which is all macOS shows of a camera.

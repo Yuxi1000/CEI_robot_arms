@@ -22,6 +22,9 @@ DEFAULT_JOINT_UPDATE_HZ = 100.0
 # 0.05 s per step, so 3 degrees per step caps joint speed near 60 deg/s.
 MAX_JOINT_STEP_DEG = 3.0
 DEFAULT_MAX_CHUNK_JOINT_DEG = 100.0
+# A chunk that follows on from the last target may start this far from the measured joints. Replay
+# trails its targets by about 2 degrees at full speed, so more than this means the arm is not tracking.
+MAX_TRACKING_LAG_DEG = 6.0
 
 
 class ChunkRefused(RuntimeError):
@@ -228,7 +231,7 @@ def check_joint_chunk(actions, start, config):
     return reach
 
 
-def apply_joint_actions(robot, actions, speed=None, update_hz=None):
+def apply_joint_actions(robot, actions, speed=None, update_hz=None, follows=None):
     """Play a chunk of absolute joint targets on a connected PiperClient: columns 0-5 degrees, column 6 gripper.
 
     Column 6 is how far the gripper closes: 0 fully open (gripper_max_mm), 1 at
@@ -238,13 +241,25 @@ def apply_joint_actions(robot, actions, speed=None, update_hz=None):
     speed (percent) falls back to joint_speed in team_config.json, then 60.
     update_hz is how often the target changes within a step; 20 holds one
     target per 0.05 s step.
+
+    follows is the last target of the chunk this one continues, for a recording
+    played in pieces. The arm trails its targets while moving, so measuring the
+    first step from the feedback would see a jump that is not there; it is
+    measured from follows instead, and the arm must be within
+    MAX_TRACKING_LAG_DEG of it.
     """
     actions = np.asarray(actions, dtype=float)
     before = robot.read_state()
     if not before["complete"]:
         raise RuntimeError("arm feedback is incomplete")
     config = load_config()
-    reach = check_joint_chunk(actions, before["joints_deg"], config)
+    start = before["joints_deg"]
+    if follows is not None:
+        start = [float(value) for value in follows]
+        lag = float(np.max(np.abs(np.asarray(start) - np.asarray(before["joints_deg"], dtype=float))))
+        if lag > MAX_TRACKING_LAG_DEG:
+            raise ChunkRefused(f"the arm is {lag:.1f} deg from the last target (max {MAX_TRACKING_LAG_DEG}). Nothing sent")
+    reach = check_joint_chunk(actions, start, config)
     speed = int(speed or config.get("joint_speed") or DEFAULT_JOINT_SPEED)
     update_hz = float(update_hz or DEFAULT_JOINT_UPDATE_HZ)
     final = actions[-1]
@@ -258,7 +273,7 @@ def apply_joint_actions(robot, actions, speed=None, update_hz=None):
     if before["status"]["ctrl_mode_name"] != "CAN_CTRL":
         robot.exit_drag_teach()
     robot.enable_arm()
-    previous = before["joints_deg"]
+    previous = start
     for step in actions:
         robot.move_joints(
             step[:6],
@@ -301,8 +316,8 @@ def serve_motion():
                     elif request[0] == "gripper_max":
                         reply = ("ok", robot.gripper_max_mm())
                     elif request[0] == "joints":
-                        _kind, actions, speed, freq = request
-                        apply_joint_actions(robot, actions, speed=speed, update_hz=freq)
+                        _kind, actions, speed, freq, follows = request
+                        apply_joint_actions(robot, actions, speed=speed, update_hz=freq, follows=follows)
                         reply = ("ok", None)
                     else:
                         apply_actions(robot, request[1])
