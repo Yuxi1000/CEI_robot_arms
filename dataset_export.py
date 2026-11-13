@@ -281,10 +281,13 @@ def export_episode(episode_dir):
         raise RuntimeError("export accepts drag or leader_follower episodes whose labels come from the measured trajectory")
     if metadata.get("success") is not True:
         raise RuntimeError("export accepts an episode only after it is marked success")
-    feedback = pd.read_parquet(episode / "robot_feedback.parquet").sort_values("t_robot")
-    images = pd.read_parquet(episode / "image_timestamps.parquet").sort_values("t_image")
+    feedback = pd.read_parquet(episode / "robot_feedback.parquet")
+    # An episode with no complete feedback sample has a parquet with no columns at all,
+    # so this must come before sort_values, which would fail on the missing t_robot.
     if feedback.empty:
-        raise RuntimeError("episode has no arm feedback")
+        raise RuntimeError("episode has no arm feedback: the bus never delivered a complete state")
+    feedback = feedback.sort_values("t_robot")
+    images = pd.read_parquet(episode / "image_timestamps.parquet").sort_values("t_image")
     # Episodes recorded before the wrist camera was added have no wrist_file column.
     has_wrist = "wrist_file" in images.columns
     # Leader columns are recorded by --leader for diagnosis; no export decision reads them.

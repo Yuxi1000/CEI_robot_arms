@@ -38,7 +38,7 @@ Stop the job and the forward with `python team_config.py down`. Check the arm wi
 
 On Windows, close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run.
 
-To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. That also rebuilds `datasets/piper_finetune`. See `用户文档.md`. With a leader arm on the same CAN bus, record with `python collect.py --leader --task "..."` instead (see `USER_GUIDE.md`). To replay the newest recording on the arm, run `python policy_link.py replay` (add `--loop` to repeat it).
+To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. That also appends the take to `datasets/piper_finetune`. See `用户文档.md`. With a leader arm on the same CAN bus, record with `python collect.py --leader --task "..."` instead (see `USER_GUIDE.md`). To replay the newest recording on the arm, run `python policy_link.py replay` (add `--loop` to repeat it).
 
 Python packages used here are `numpy`, `opencv-python`, `msgpack`, `websockets`, `python-can`, and AgileX's `pyAgxArm` (`pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"`). Recording also needs `pandas` and `pyarrow`. Mac also needs `pyusb`, `pyobjc-framework-AVFoundation`, and `brew install libusb`. All CAN traffic goes through `pyAgxArm`; `piper_can_bus.py` lets it use the candleLight over USB on Windows and macOS.
 
@@ -56,7 +56,7 @@ Python packages used here are `numpy`, `opencv-python`, `msgpack`, `websockets`,
 | `piper_can_bus.py` | CAN backend per platform for `pyAgxArm` |
 | `check_candidate_repo.py` | Search a candidate policy repo before changing the action mapping |
 | `_can_listen.py` | Receive-only CAN capture |
-| `collect.py` | Record, check, export, and rebuild `datasets/piper_finetune` after `s`. `--latest` does that for the newest episode |
+| `collect.py` | Record, check, export, and append the take to `datasets/piper_finetune` after `s`. `--latest` does that for the newest episode |
 | `episode_recorder.py` | Read-only drag-teach episode: arm feedback, one third-view and one wrist frame per control step, start and success or failure |
 | `episode_check.py` | Print the episode timeline and save pose curves beside both camera strips |
 | `dataset_export.py` | Resample a successful drag episode to 0.05 s. Intervals that are not teach mode, lack a fresh image from either camera, or jump are masked |

@@ -13,3 +13,6 @@ piper_link_state.json
 # Holds this machine's account, host and checkpoint; the empty template is
 # team_config.example.json.
 team_config.json
+
+# This bench's pen-task collection session. The shared recorder is collect.py.
+collect_pen_tasks.py

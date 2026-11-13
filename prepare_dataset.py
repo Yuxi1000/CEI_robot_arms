@@ -10,7 +10,8 @@ See 服务器训练对接.md.
     python prepare_dataset.py
     python prepare_dataset.py --self-check
 
-collect.py runs this after a successful export.
+collect.py runs this after a successful export. A new success is appended to the
+dataset already on disk. Running this file directly still rebuilds every episode.
 """
 
 import argparse
@@ -264,6 +265,126 @@ def _stats(values):
     }
 
 
+def _read_jsonl(path):
+    rows = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def _replace_text(path, text):
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _write_json(path, payload):
+    _replace_text(path, json.dumps(payload, indent=2) + "\n")
+
+
+def _write_jsonl(path, rows):
+    _replace_text(path, "".join(json.dumps(row) + "\n" for row in rows))
+
+
+def _merge_stats(previous, added):
+    """Population mean, std, min, and max of previous stats plus new rows.
+
+    The previous episodes stay on disk unread. Std is the population std, matching _stats.
+    """
+    added = np.asarray(added, dtype=np.float64)
+    count_before = int(previous["count"][0])
+    mean_before = np.asarray(previous["mean"], dtype=np.float64)
+    std_before = np.asarray(previous["std"], dtype=np.float64)
+    count_added = int(added.shape[0])
+    mean_added = added.mean(axis=0)
+    std_added = added.std(axis=0)
+    count = count_before + count_added
+    mean = (mean_before * count_before + mean_added * count_added) / count
+    second_moment = (std_before**2 + mean_before**2) * count_before + (std_added**2 + mean_added**2) * count_added
+    variance = np.maximum(second_moment / count - mean**2, 0.0)
+    return {
+        "mean": mean.tolist(),
+        "std": np.sqrt(variance).tolist(),
+        "min": np.minimum(np.asarray(previous["min"], dtype=np.float64), added.min(axis=0)).tolist(),
+        "max": np.maximum(np.asarray(previous["max"], dtype=np.float64), added.max(axis=0)).tolist(),
+        "count": [count],
+    }
+
+
+def _chunk(episode_index, chunks_size):
+    return f"chunk-{int(episode_index) // int(chunks_size):03d}"
+
+
+def _write_episode_files(dest, episode_index, task_index, segment, global_index, sizes, codecs, chunks_size):
+    """Write one segment's parquet and two videos. Returns the row count and the files created."""
+    chunk = _chunk(episode_index, chunks_size)
+    data_dir = Path(dest) / "data" / chunk
+    video_root = Path(dest) / "videos" / chunk
+    data_dir.mkdir(parents=True, exist_ok=True)
+    count = len(segment["images"])
+    written = []
+    try:
+        for video_key, image_paths in ((VIDEO_KEY, segment["images"]), (WRIST_VIDEO_KEY, segment["wrist_images"])):
+            path = video_root / video_key / f"episode_{episode_index:06d}.mp4"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            written.append(path)
+            frame_height, frame_width, video_codec = _write_video(path, image_paths)
+            if video_key not in sizes:
+                sizes[video_key] = (frame_height, frame_width)
+                codecs[video_key] = video_codec
+            elif sizes[video_key] != (frame_height, frame_width):
+                raise RuntimeError(f"image size of {video_key} changed at segment {episode_index}")
+        table = pa.table(
+            {
+                "observation.state": pa.array(segment["states"].tolist(), type=pa.list_(pa.float32(), 16)),
+                "action": pa.array(segment["actions"].tolist(), type=pa.list_(pa.float32(), 12)),
+                "timestamp": pa.array((np.arange(count) * CONTROL_DT_S).astype(np.float32)),
+                "frame_index": pa.array(np.arange(count), type=pa.int64()),
+                "episode_index": pa.array(np.full(count, episode_index), type=pa.int64()),
+                "task_index": pa.array(np.full(count, task_index), type=pa.int64()),
+                "index": pa.array(np.arange(global_index, global_index + count), type=pa.int64()),
+            }
+        )
+        parquet_path = data_dir / f"episode_{episode_index:06d}.parquet"
+        written.append(parquet_path)
+        pq.write_table(table, parquet_path)
+        return count, written
+    except BaseException:
+        for path in written:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _segments_of(episode, min_rows):
+    episode = Path(episode)
+    metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("success") is not True:
+        return []
+    if metadata.get("collection_mode") not in COLLECTION_MODES or metadata.get("action_source") != "measured_trajectory":
+        return []
+    grid_path = episode / "export" / "grid.parquet"
+    if not grid_path.is_file():
+        return []
+    grid = pd.read_parquet(grid_path)
+    timestamps_path = episode / "image_timestamps.parquet"
+    timestamps = pd.read_parquet(timestamps_path) if timestamps_path.is_file() else None
+    task = str(metadata.get("task_text") or "")
+    return _segments_from_grid(episode, grid, timestamps, task, min_rows)
+
+
+def _sources_in_order(rows):
+    sources = []
+    seen = set()
+    for row in rows:
+        source = row.get("source_episode")
+        if source and source not in seen:
+            seen.add(source)
+            sources.append(source)
+    return sources
+
+
 def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
     episodes_dir = Path(episodes_dir)
     dest = Path(dest)
@@ -282,11 +403,7 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
     dest = final.with_name(final.name + ".building")
     if dest.exists():
         shutil.rmtree(dest)
-    data_dir = dest / "data" / "chunk-000"
-    video_root = dest / "videos" / "chunk-000"
     meta_dir = dest / "meta"
-    data_dir.mkdir(parents=True)
-    video_root.mkdir(parents=True)
     meta_dir.mkdir(parents=True)
 
     tasks = []
@@ -302,29 +419,9 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
         if task not in task_to_index:
             task_to_index[task] = len(tasks)
             tasks.append(task)
-        task_index = task_to_index[task]
-        count = len(segment["images"])
-        for video_key, image_paths in ((VIDEO_KEY, segment["images"]), (WRIST_VIDEO_KEY, segment["wrist_images"])):
-            frame_height, frame_width, video_codec = _write_video(
-                video_root / video_key / f"episode_{episode_index:06d}.mp4", image_paths
-            )
-            if video_key not in sizes:
-                sizes[video_key] = (frame_height, frame_width)
-                codecs[video_key] = video_codec
-            elif sizes[video_key] != (frame_height, frame_width):
-                raise RuntimeError(f"image size of {video_key} changed at segment {episode_index}")
-        table = pa.table(
-            {
-                "observation.state": pa.array(segment["states"].tolist(), type=pa.list_(pa.float32(), 16)),
-                "action": pa.array(segment["actions"].tolist(), type=pa.list_(pa.float32(), 12)),
-                "timestamp": pa.array((np.arange(count) * CONTROL_DT_S).astype(np.float32)),
-                "frame_index": pa.array(np.arange(count), type=pa.int64()),
-                "episode_index": pa.array(np.full(count, episode_index), type=pa.int64()),
-                "task_index": pa.array(np.full(count, task_index), type=pa.int64()),
-                "index": pa.array(np.arange(global_index, global_index + count), type=pa.int64()),
-            }
+        count, _paths = _write_episode_files(
+            dest, episode_index, task_to_index[task], segment, global_index, sizes, codecs, 1000
         )
-        pq.write_table(table, data_dir / f"episode_{episode_index:06d}.parquet")
         episodes.append(
             {
                 "episode_index": episode_index,
@@ -337,23 +434,20 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
         action_rows.append(segment["actions"])
         global_index += count
 
-    (meta_dir / "tasks.jsonl").write_text(
-        "".join(json.dumps({"task_index": index, "task": task}) + "\n" for index, task in enumerate(tasks)),
-        encoding="utf-8",
+    _write_jsonl(
+        meta_dir / "tasks.jsonl",
+        [{"task_index": index, "task": task} for index, task in enumerate(tasks)],
     )
-    (meta_dir / "episodes.jsonl").write_text(
-        "".join(json.dumps(episode) + "\n" for episode in episodes),
-        encoding="utf-8",
-    )
+    _write_jsonl(meta_dir / "episodes.jsonl", episodes)
     stats = {"observation.state": _stats(np.concatenate(state_rows)), "action": _stats(np.concatenate(action_rows))}
-    (meta_dir / "stats.json").write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
+    _write_json(meta_dir / "stats.json", stats)
     modality = {
         "already_in_model_order": True,
         "state": {name: {"start": index, "end": index + 1} for index, name in enumerate(STATE_NAMES)},
         "action": {name: {"start": index, "end": index + 1} for index, name in enumerate(ACTION_NAMES)},
         "video": {key: {"camera_count": 1, "color": "bgr"} for key in VIDEO_KEYS},
     }
-    (meta_dir / "modality.json").write_text(json.dumps(modality, indent=2) + "\n", encoding="utf-8")
+    _write_json(meta_dir / "modality.json", modality)
     features = {
         "observation.state": {"dtype": "float32", "shape": [16], "names": list(STATE_NAMES)},
         "action": {"dtype": "float32", "shape": [12], "names": list(ACTION_NAMES)},
@@ -386,7 +480,12 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
         "video_keys": list(VIDEO_KEYS),
         "norm": "z-score, population std, server adds 1e-6",
     }
-    (meta_dir / "info.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+    _write_json(meta_dir / "info.json", info)
+    # Which takes are already in this dataset, so the next success can append instead of rebuilding.
+    _write_json(
+        meta_dir / "pack_state.json",
+        {"source_episodes": _sources_in_order(episodes), "skipped_episodes": list(skipped)},
+    )
     if final.exists():
         shutil.rmtree(final)
     dest.rename(final)
@@ -397,11 +496,150 @@ def build_dataset(episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
     return final
 
 
-def self_check(root):
+def _pack_lists(dest, episodes_meta):
+    """Packed and skipped take names. Without pack_state.json, skips are unknown and come back as extras."""
+    path = Path(dest) / "meta" / "pack_state.json"
+    if path.is_file():
+        state = json.loads(path.read_text(encoding="utf-8"))
+        return list(state.get("source_episodes") or []), list(state.get("skipped_episodes") or [])
+    return _sources_in_order(episodes_meta), []
+
+
+def _dataset_matches(info, episodes_meta, stats):
+    if info.get("total_episodes") != len(episodes_meta):
+        return False
+    if [row.get("episode_index") for row in episodes_meta] != list(range(len(episodes_meta))):
+        return False
+    if info.get("total_frames") != sum(row["length"] for row in episodes_meta):
+        return False
+    if int(stats["observation.state"]["count"][0]) != info.get("total_frames"):
+        return False
+    if int(stats["action"]["count"][0]) != info.get("total_frames"):
+        return False
+    return True
+
+
+def append_episode(episode, episodes_dir, dest=DEST_DIR, min_rows=MIN_SEGMENT_ROWS):
+    """Add one successful take to a dataset without re-encoding the takes already in it.
+
+    Pressing s used to rebuild every video, so the wait grew with the number of takes.
+    The whole dataset is rebuilt when it is missing, its metadata disagrees with itself,
+    or disk holds successful takes the dataset has never seen.
+    """
+    episode = Path(episode)
+    episodes_dir = Path(episodes_dir)
+    dest = Path(dest)
+    info_path = dest / "meta" / "info.json"
+    if not info_path.is_file():
+        return build_dataset(episodes_dir, dest, min_rows)
+
+    meta_dir = dest / "meta"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    episodes_meta = _read_jsonl(meta_dir / "episodes.jsonl")
+    stats = json.loads((meta_dir / "stats.json").read_text(encoding="utf-8"))
+    if not _dataset_matches(info, episodes_meta, stats):
+        print(f"dataset metadata is inconsistent; rebuilding {dest}", flush=True)
+        return build_dataset(episodes_dir, dest, min_rows)
+
+    packed, skipped = _pack_lists(dest, episodes_meta)
+    known = set(packed) | set(skipped)
+    name = episode.name
+    if name in packed:
+        print(f"already packed, left in place: {name}", flush=True)
+        return dest
+    if name in skipped:
+        print(f"already skipped, left in place: {name}", flush=True)
+        return dest
+
+    # A dataset written before pack_state.json does not remember takes that were too short to pack.
+    # Those names are the only reason to rebuild once; after that the skips are recorded.
+    on_disk = [path.name for path, _metadata in _episode_dirs(episodes_dir)]
+    extras = [item for item in on_disk if item not in known and item != name]
+    if extras:
+        print(
+            f"dataset is missing {len(extras)} earlier take(s); rebuilding once, later saves only append",
+            flush=True,
+        )
+        return build_dataset(episodes_dir, dest, min_rows)
+
+    found = _segments_of(episode, min_rows)
+    if not found:
+        skipped.append(name)
+        _write_json(meta_dir / "pack_state.json", {"source_episodes": packed, "skipped_episodes": skipped})
+        print(f"not packed (under {min_rows} continuous rows): {name}", flush=True)
+        return dest
+
+    tasks = _read_jsonl(meta_dir / "tasks.jsonl")
+    task_to_index = {row["task"]: row["task_index"] for row in tasks}
+    sizes = {}
+    codecs = {}
+    for key in VIDEO_KEYS:
+        shape = info["features"][key]["shape"]
+        sizes[key] = (shape[0], shape[1])
+        codecs[key] = info["features"][key]["info"]["video.codec"]
+    chunks_size = int(info.get("chunks_size") or 1000)
+    frames_before = int(info["total_frames"])
+    global_index = frames_before
+    episode_index = int(info["total_episodes"])
+    state_rows = []
+    action_rows = []
+    new_rows = []
+    created = []
+    try:
+        for segment in found:
+            task = segment["task"]
+            if task not in task_to_index:
+                task_to_index[task] = len(tasks)
+                tasks.append({"task_index": task_to_index[task], "task": task})
+            count, paths = _write_episode_files(
+                dest, episode_index, task_to_index[task], segment, global_index, sizes, codecs, chunks_size
+            )
+            created.extend(paths)
+            new_rows.append(
+                {
+                    "episode_index": episode_index,
+                    "tasks": [task],
+                    "length": count,
+                    "source_episode": segment["source"],
+                }
+            )
+            state_rows.append(segment["states"])
+            action_rows.append(segment["actions"])
+            global_index += count
+            episode_index += 1
+    except BaseException:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+
+    episodes_meta.extend(new_rows)
+    packed.append(name)
+    info["total_episodes"] = episode_index
+    info["total_frames"] = global_index
+    info["total_tasks"] = len(tasks)
+    stats = {
+        "observation.state": _merge_stats(stats["observation.state"], np.concatenate(state_rows)),
+        "action": _merge_stats(stats["action"], np.concatenate(action_rows)),
+    }
+    # pack_state.json is last. If this stops halfway, the next save sees the disagreement and rebuilds.
+    _write_jsonl(meta_dir / "tasks.jsonl", tasks)
+    _write_jsonl(meta_dir / "episodes.jsonl", episodes_meta)
+    _write_json(meta_dir / "stats.json", stats)
+    _write_json(meta_dir / "info.json", info)
+    _write_json(meta_dir / "pack_state.json", {"source_episodes": packed, "skipped_episodes": skipped})
+    print(
+        f"appended source={name} episodes={len(new_rows)} frames={global_index - frames_before} "
+        f"total_episodes={episode_index} path={dest}",
+        flush=True,
+    )
+    return dest
+
+
+def _check_take(episode, task="self-check", frames=65, x_step=1.0, split=True):
+    """One synthetic drag take. split=True is the 65-step take the numeric checks expect."""
     from dataset_export import export_episode
 
-    root = Path(root)
-    episode = root / "episode_self_check"
+    episode = Path(episode)
     if episode.exists():
         shutil.rmtree(episode)
     images = episode / "images"
@@ -410,10 +648,10 @@ def self_check(root):
     wrist_images.mkdir(parents=True)
     rows = []
     stamps = []
-    # 30 teaching steps closed, 5 steps not teaching, 30 teaching steps open.
-    for index in range(65):
-        teaching = index < 30 or index >= 35
-        gripper = 22.0 if index < 35 else 80.0
+    for index in range(frames):
+        # 30 teaching steps closed, 5 steps not teaching, 30 teaching steps open.
+        teaching = index < 30 or index >= 35 if split else True
+        gripper = 22.0 if not split or index < 35 else 80.0
         rows.append(
             {
                 "t_robot": index * CONTROL_DT_S,
@@ -424,7 +662,7 @@ def self_check(root):
                 "j5_deg": 0,
                 "j6_deg": 0,
                 "gripper_mm": gripper,
-                "x_mm": index * 1.0,
+                "x_mm": index * x_step,
                 "y_mm": 0.0,
                 "z_mm": 200.0,
                 "rx_deg": 0.0,
@@ -455,7 +693,7 @@ def self_check(root):
         json.dumps(
             {
                 "episode_id": episode.name,
-                "task_text": "self-check",
+                "task_text": task,
                 "collection_mode": "drag",
                 "action_source": "measured_trajectory",
                 "success": True,
@@ -466,6 +704,26 @@ def self_check(root):
         encoding="utf-8",
     )
     export_episode(episode)
+    return episode
+
+
+def _table_vectors(folder, index):
+    table = pq.read_table(folder / "data" / "chunk-000" / f"episode_{index:06d}.parquet").to_pandas()
+    return np.stack(table["observation.state"].to_numpy()), np.stack(table["action"].to_numpy())
+
+
+def self_check(root):
+    root = Path(root)
+    left = np.arange(20, dtype=np.float64).reshape(5, 4)
+    right = np.arange(20, 44, dtype=np.float64).reshape(6, 4)
+    merged = _merge_stats(_stats(left), right)
+    exact = _stats(np.concatenate([left, right]))
+    for field in ("mean", "std", "min", "max"):
+        if not np.allclose(merged[field], exact[field], rtol=1e-6, atol=1e-6):
+            raise RuntimeError(f"merge stats {field}")
+    if merged["count"] != exact["count"]:
+        raise RuntimeError("merge stats count")
+    _check_take(root / "episode_self_check")
     dest = root / "piper_finetune"
     build_dataset(root, dest, min_rows=10)
     info = json.loads((dest / "meta" / "info.json").read_text(encoding="utf-8"))
@@ -501,6 +759,48 @@ def self_check(root):
             raise RuntimeError(f"self-check {video_key} frames {frames} != rows {len(first)}")
     if info["physical_camera_count"] != 2 or info["video_keys"] != list(VIDEO_KEYS):
         raise RuntimeError("self-check dual camera metadata")
+    kept = {
+        path: path.read_bytes()
+        for path in list((dest / "videos").rglob("*.mp4")) + list((dest / "data").rglob("*.parquet"))
+    }
+    _check_take(root / "episode_self_check_b", task="self-check-b", x_step=2.0)
+    append_episode(root / "episode_self_check_b", root, dest, min_rows=10)
+    for path, blob in kept.items():
+        if path.read_bytes() != blob:
+            raise RuntimeError(f"append rewrote an existing video: {path}")
+    info = json.loads((dest / "meta" / "info.json").read_text(encoding="utf-8"))
+    if info["total_episodes"] != 4 or info["total_tasks"] != 2:
+        raise RuntimeError(f"append totals episodes={info['total_episodes']} tasks={info['total_tasks']}")
+    append_episode(root / "episode_self_check_b", root, dest, min_rows=10)
+    info = json.loads((dest / "meta" / "info.json").read_text(encoding="utf-8"))
+    if info["total_episodes"] != 4:
+        raise RuntimeError("appending the same take twice grew the dataset")
+    rebuilt = root / "piper_finetune_full"
+    build_dataset(root, rebuilt, min_rows=10)
+    for index in range(4):
+        appended_state, appended_action = _table_vectors(dest, index)
+        rebuilt_state, rebuilt_action = _table_vectors(rebuilt, index)
+        if not np.allclose(appended_state, rebuilt_state) or not np.allclose(appended_action, rebuilt_action):
+            raise RuntimeError(f"append diverged from a full rebuild at episode {index}")
+    appended_stats = json.loads((dest / "meta" / "stats.json").read_text(encoding="utf-8"))
+    rebuilt_stats = json.loads((rebuilt / "meta" / "stats.json").read_text(encoding="utf-8"))
+    for key in ("observation.state", "action"):
+        for field in ("mean", "std", "min", "max"):
+            if not np.allclose(appended_stats[key][field], rebuilt_stats[key][field], rtol=1e-5, atol=1e-5):
+                raise RuntimeError(f"stats {key}.{field} diverged from a full rebuild")
+        if appended_stats[key]["count"] != rebuilt_stats[key]["count"]:
+            raise RuntimeError(f"stats {key}.count diverged from a full rebuild")
+    _check_take(root / "episode_self_check_short", task="self-check-short", frames=6, x_step=3.0, split=False)
+    append_episode(root / "episode_self_check_short", root, dest, min_rows=10)
+    info = json.loads((dest / "meta" / "info.json").read_text(encoding="utf-8"))
+    if info["total_episodes"] != 4:
+        raise RuntimeError("a take under min_rows was packed")
+    for path, blob in kept.items():
+        if path.read_bytes() != blob:
+            raise RuntimeError(f"skipping a short take rewrote an existing video: {path}")
+    state = json.loads((dest / "meta" / "pack_state.json").read_text(encoding="utf-8"))
+    if "episode_self_check_short" not in state["skipped_episodes"]:
+        raise RuntimeError("short take was not recorded as skipped")
     print("self-check passed", flush=True)
 
 
