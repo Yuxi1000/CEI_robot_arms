@@ -251,11 +251,18 @@ def _action(current, nxt, current_rotation, next_rotation):
     return values, mask
 
 
+# Drag on this arm stays CAN_CTRL or TEACHING, and teach_status stays 2 while the
+# person is moving it. teach_status == 1 never showed up on a real take, so it is
+# not a gate. A stationary arm is still refused by the path check below.
+DRAG_MODES = ("CAN_CTRL", "TEACHING")
+
+
 def demonstrating(collection_mode, ctrl_mode_name, teach_status):
     """Whether a feedback sample is part of the demonstration for this collection mode."""
+    del teach_status
     if collection_mode == "leader_follower":
         return ctrl_mode_name in FOLLOWING_MODES
-    return int(teach_status) == 1 and ctrl_mode_name == "TEACHING"
+    return ctrl_mode_name in DRAG_MODES
 
 
 def _interval_blocked(start_flags, end_flags):
@@ -580,6 +587,7 @@ def _self_check_not_teaching(root):
         [(0.0, 0.0, 200.0), (40.0, 0.0, 200.0)],
         [80.0, 80.0],
         teach=0,
+        mode_name="STANDBY",
     )
     episode = root / "not_teaching"
     _write_synthetic(episode, feedback, 0.05)

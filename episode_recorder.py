@@ -42,39 +42,63 @@ NO_FEEDBACK_WARN_S = 2.0
 PREVIEW_TITLE = "episode recorder (s success, f failure, d discard)"
 
 
-def focus_window(title):
-    """Best effort: give our own OpenCV window the keyboard focus, so a key works without a click.
+def raise_preview(title):
+    """Put the recorder window on the top layer of the display. Returns True once that window exists.
 
-    cv2.waitKey only receives keys while the window is focused. Windows refuses SetForegroundWindow
-    from a process that did not receive the last input, which is the case whenever the operator
-    clicked the terminal; attaching to the foreground thread's input queue lifts that restriction.
-    macOS and Linux leave the focus alone, since their window managers decide it.
+    OpenCV's Win32 handle is 64-bit, so the calls below declare pointer-sized arguments; without that,
+    SetForegroundWindow is handed a truncated handle and the window stays behind the terminal.
+    Topmost is cleared again when the take ends, so the Enter prompt in the terminal can be used.
     """
-    if sys.platform != "win32":
+    try:
+        cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)
+    except cv2.error:
         return False
+    if sys.platform != "win32":
+        return True
     try:
         import ctypes
 
         user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+        user32.SwitchToThisWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
         hwnd = user32.FindWindowW(None, title)
         if not hwnd:
             return False
         user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        if user32.GetForegroundWindow() == hwnd:
-            return True
-        foreground = user32.GetForegroundWindow()
-        theirs = user32.GetWindowThreadProcessId(hwnd, None)
-        ours = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
-        attached = False
-        if theirs and ours and theirs != ours:
-            attached = bool(user32.AttachThreadInput(ours, theirs, True))
+        # HWND_TOPMOST, then show without moving or resizing.
+        user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0043)
+        user32.BringWindowToTop(hwnd)
+        # A tapped Alt is what lets SetForegroundWindow through after the operator clicked the terminal.
+        user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(0x12, 0, 2, 0)
+        user32.SwitchToThisWindow(hwnd, 1)
         user32.SetForegroundWindow(hwnd)
-        if attached:
-            user32.AttachThreadInput(ours, theirs, False)
-        return user32.GetForegroundWindow() == hwnd
     except Exception:
-        # A window that cannot be focused only costs a click; never break the recording over it.
-        return False
+        # The OpenCV topmost flag above already raised the window. A focus failure must not stop recording.
+        return True
+    return True
+
+
+def rest_preview(title):
+    """Drop the recorder window back out of the top layer when the take ends."""
+    try:
+        cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 0)
+    except cv2.error:
+        pass
 
 
 class KeyReader:
@@ -237,13 +261,15 @@ def write_episode_video(episode, path=None):
     return path if wrote else None
 
 
-def record_episode(task, out_dir, seconds=None, preview=True, leader=False, cameras=None, origin=None):
+def record_episode(task, out_dir, seconds=None, preview=True, leader=False, cameras=None, robot=None, origin=None):
     """Record one episode. leader=True records master/slave teleoperation: this arm is the follower and the
     leader's broadcast commands are stored in lead_* columns. Either way this program only reads the bus.
 
-    Pass ``cameras`` and ``origin`` to record inside a session that is already open, as pointing.py does when
-    a human demonstration comes first: the two phases then share one clock and one camera session, so their
-    timestamps sit on a single timeline with no gap. Whoever opened the session keeps it open.
+    Pass ``cameras``, ``robot``, and ``origin`` to record inside a session that is already open, as
+    pointing.py does when a human demonstration comes first: the two phases then share one clock and one
+    camera session, so their timestamps sit on a single timeline with no gap. Whoever opened the session
+    keeps it open. Opening the cameras and the arm before the operator presses Enter is what makes
+    recording start immediately.
     """
     if leader:
         print("keys: s success, f failure, d discard. Move the leader arm; this program only reads.", flush=True)
@@ -255,13 +281,15 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False, came
     owns_cameras = cameras is None
     if owns_cameras:
         cameras = PolicyCameras().__enter__()
-    robot = PiperClient()
-    try:
-        robot.connect()
-    except BaseException:
-        if owns_cameras:
-            cameras.__exit__(None, None, None)
-        raise
+    owns_robot = robot is None
+    if owns_robot:
+        robot = PiperClient()
+        try:
+            robot.connect()
+        except BaseException:
+            if owns_cameras:
+                cameras.__exit__(None, None, None)
+            raise
 
     episode_id = time.strftime("episode_%Y%m%d_%H%M%S")
     episode = Path(out_dir) / episode_id
@@ -341,9 +369,8 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False, came
                         try:
                             window_key = _show_preview(frames, t_image, len(images))
                             if not focused:
-                                # The operator is coming from the demonstration's window, so take the
-                                # focus back: otherwise s would be typed into the terminal instead.
-                                focused = focus_window(PREVIEW_TITLE)
+                                # Each take starts behind the terminal the operator just typed Enter into.
+                                focused = raise_preview(PREVIEW_TITLE)
                         except cv2.error as exc:
                             # OpenCV built without a GUI (headless): keep recording without the window.
                             print(f"preview off: {exc}", flush=True)
@@ -398,9 +425,12 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False, came
             if owns_cameras:
                 cameras.close()
             writer.finish()
-            robot.close()
-            if preview and owns_cameras:
-                cv2.destroyAllWindows()
+            if owns_robot:
+                robot.close()
+            if preview:
+                rest_preview(PREVIEW_TITLE)
+                if owns_cameras:
+                    cv2.destroyAllWindows()
 
     metadata["success"] = success
     metadata["termination_reason"] = reason

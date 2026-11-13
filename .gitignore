@@ -5,6 +5,10 @@ _camera_test/
 _camera_test*/
 _can_listen_log.txt
 
+# Copies written by clean_idle.py. The two rules above already cover them.
+episodes/pen_tasks_clean/
+datasets/pen_tasks_clean/
+
 # Local machine state.
 .venv/
 __pycache__/

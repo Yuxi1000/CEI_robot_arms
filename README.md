@@ -4,7 +4,21 @@ A Windows or Mac computer reads an AgileX Piper and two Intel RealSense D405 cam
 
 本机可以是 Windows 或 Mac。它经 candleLight 读取 AgileX Piper，用两台 Intel RealSense D405（第三视角和腕部）各拍一张彩色图，把这两帧作为观测图像，经 SSH 隧道发给计算节点上的策略服务。服务每次返回一段末端增量。本机按底座坐标执行，然后重新观测，直到按 `Ctrl+C`。两台相机按序列号在 `team_config.json` 里指定，不按 OpenCV 编号。Mac 上用仓库里的 `.venv/bin/python`，并先按开发文档安装 libusb。
 
-操作步骤看 [`用户文档.md`](用户文档.md)，英文版是 [`USER_GUIDE.md`](USER_GUIDE.md)。改观测、动作映射或 CAN 协议时看 [`开发文档.md`](开发文档.md)，英文版是 [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md)。训练数据采集的规定看 [`数据采集.md`](数据采集.md)。服务器上怎么加载微调数据看 [`服务器训练对接.md`](服务器训练对接.md)，英文版是 [`SERVER_TRAINING.md`](SERVER_TRAINING.md)。
+操作步骤看 [`用户文档.md`](用户文档.md)，英文版是 [`USER_GUIDE.md`](USER_GUIDE.md)。改观测、动作映射或 CAN 协议时看 [`开发文档.md`](开发文档.md)，英文版是 [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md)。训练数据采集的规定看 [`数据采集.md`](数据采集.md)。真机效果不好时，先核对下面的 [Real-robot data collection (required reading)](#real-robot-data-collection-required-reading)。服务器上怎么加载微调数据看 [`服务器训练对接.md`](服务器训练对接.md)，英文版是 [`SERVER_TRAINING.md`](SERVER_TRAINING.md)。
+
+## Real-robot data collection (required reading)
+
+> [!IMPORTANT]
+> **Required reading before you keep a real-robot take.** If you want the policy to work on the real arm, check every item below. These are the usual reasons a fine-tune looks trained and then fails on the robot.
+
+> [!CAUTION]
+> **Remove blank frames.** Idle frames — the arm sitting still, or an empty gap between motions — make the policy **overfit**. The standard symptom at inference is that **the arm does not move**.
+
+> [!CAUTION]
+> **Do not record the retract.** A take must not include the arm returning, folding back, or homing. That motion is not the task. Leaving it in makes the policy **underfit**.
+
+> [!IMPORTANT]
+> **Demonstrate as slowly as you can.** Collection stores one still from each camera at a time; those stills are later assembled into the training video. A slow demonstration gives every action a richer set of observations to condition on.
 
 ```mermaid
 flowchart LR
