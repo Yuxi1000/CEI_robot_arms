@@ -37,7 +37,68 @@ SCHEMA_VERSION = 1
 CAPTURE_DT_S = 0.05
 # A gap longer than this between saved frames is counted in metadata.json.
 GAP_S = 0.15
+# Say so while the take is still running when the bus never delivered a state.
+NO_FEEDBACK_WARN_S = 2.0
 PREVIEW_TITLE = "episode recorder (s success, f failure, d discard)"
+
+
+def raise_preview(title):
+    """Put the recorder window on the top layer of the display. Returns True once that window exists.
+
+    OpenCV's Win32 handle is 64-bit, so the calls below declare pointer-sized arguments; without that,
+    SetForegroundWindow is handed a truncated handle and the window stays behind the terminal.
+    Topmost is cleared again when the take ends, so the Enter prompt in the terminal can be used.
+    """
+    try:
+        cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)
+    except cv2.error:
+        return False
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+        user32.SwitchToThisWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd:
+            return False
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        # HWND_TOPMOST, then show without moving or resizing.
+        user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0043)
+        user32.BringWindowToTop(hwnd)
+        # A tapped Alt is what lets SetForegroundWindow through after the operator clicked the terminal.
+        user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(0x12, 0, 2, 0)
+        user32.SwitchToThisWindow(hwnd, 1)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        # The OpenCV topmost flag above already raised the window. A focus failure must not stop recording.
+        return True
+    return True
+
+
+def rest_preview(title):
+    """Drop the recorder window back out of the top layer when the take ends."""
+    try:
+        cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 0)
+    except cv2.error:
+        pass
 
 
 class KeyReader:
@@ -200,9 +261,16 @@ def write_episode_video(episode, path=None):
     return path if wrote else None
 
 
-def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
+def record_episode(task, out_dir, seconds=None, preview=True, leader=False, cameras=None, robot=None, origin=None):
     """Record one episode. leader=True records master/slave teleoperation: this arm is the follower and the
-    leader's broadcast commands are stored in lead_* columns. Either way this program only reads the bus."""
+    leader's broadcast commands are stored in lead_* columns. Either way this program only reads the bus.
+
+    Pass ``cameras``, ``robot``, and ``origin`` to record inside a session that is already open, as
+    pointing.py does when a human demonstration comes first: the two phases then share one clock and one
+    camera session, so their timestamps sit on a single timeline with no gap. Whoever opened the session
+    keeps it open. Opening the cameras and the arm before the operator presses Enter is what makes
+    recording start immediately.
+    """
     if leader:
         print("keys: s success, f failure, d discard. Move the leader arm; this program only reads.", flush=True)
     else:
@@ -210,13 +278,18 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
     if preview and not has_display():
         print("preview off: no display (over SSH, for example)", flush=True)
         preview = False
-    cameras = PolicyCameras().__enter__()
-    robot = PiperClient()
-    try:
-        robot.connect()
-    except BaseException:
-        cameras.__exit__(None, None, None)
-        raise
+    owns_cameras = cameras is None
+    if owns_cameras:
+        cameras = PolicyCameras().__enter__()
+    owns_robot = robot is None
+    if owns_robot:
+        robot = PiperClient()
+        try:
+            robot.connect()
+        except BaseException:
+            if owns_cameras:
+                cameras.__exit__(None, None, None)
+            raise
 
     episode_id = time.strftime("episode_%Y%m%d_%H%M%S")
     episode = Path(out_dir) / episode_id
@@ -224,7 +297,7 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
     wrist_dir = episode / "images_wrist"
     image_dir.mkdir(parents=True)
     wrist_dir.mkdir(parents=True)
-    origin = time.perf_counter()
+    origin = time.perf_counter() if origin is None else origin
     events = episode / "events.jsonl"
     metadata = {
         "episode_id": episode_id,
@@ -263,6 +336,8 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
     error = None
     last_image_t = None
     window_key = None
+    warned_no_feedback = False
+    focused = False
     writer = _ImageWriter(image_dir, wrist_dir)
     with KeyReader() as keys:
         try:
@@ -293,6 +368,9 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
                     if preview:
                         try:
                             window_key = _show_preview(frames, t_image, len(images))
+                            if not focused:
+                                # Each take starts behind the terminal the operator just typed Enter into.
+                                focused = raise_preview(PREVIEW_TITLE)
                         except cv2.error as exc:
                             # OpenCV built without a GUI (headless): keep recording without the window.
                             print(f"preview off: {exc}", flush=True)
@@ -309,6 +387,14 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
                     feedback.append(_feedback_row(state, t_robot, command))
                 else:
                     metadata["incomplete_reads"] += 1
+                    if not feedback and not warned_no_feedback and _clock(origin) > NO_FEEDBACK_WARN_S:
+                        # Cameras keep working while the CAN side is dead, so say it now
+                        # instead of after the take: the export needs feedback to exist.
+                        warned_no_feedback = True
+                        print(
+                            f"warning: no arm feedback after {NO_FEEDBACK_WARN_S:.0f} s; check arm power and the CAN adapter",
+                            flush=True,
+                        )
                 if seconds is not None and _clock(origin) >= seconds:
                     reason = "smoke"
                     break
@@ -335,11 +421,16 @@ def record_episode(task, out_dir, seconds=None, preview=True, leader=False):
             reason, success = "error", None
             error = exc
         finally:
-            cameras.close()
+            # An externally owned session outlives this recording, and so does its window.
+            if owns_cameras:
+                cameras.close()
             writer.finish()
-            robot.close()
+            if owns_robot:
+                robot.close()
             if preview:
-                cv2.destroyAllWindows()
+                rest_preview(PREVIEW_TITLE)
+                if owns_cameras:
+                    cv2.destroyAllWindows()
 
     metadata["success"] = success
     metadata["termination_reason"] = reason

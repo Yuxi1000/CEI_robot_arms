@@ -4,7 +4,21 @@ A Windows or Mac computer reads an AgileX Piper and two Intel RealSense D405 cam
 
 本机可以是 Windows 或 Mac。它经 candleLight 读取 AgileX Piper，用两台 Intel RealSense D405（第三视角和腕部）各拍一张彩色图，把这两帧作为观测图像，经 SSH 隧道发给计算节点上的策略服务。服务每次返回一段末端增量。本机按底座坐标执行，然后重新观测，直到按 `Ctrl+C`。两台相机按序列号在 `team_config.json` 里指定，不按 OpenCV 编号。Mac 上用仓库里的 `.venv/bin/python`，并先按开发文档安装 libusb。
 
-操作步骤看 [`用户文档.md`](用户文档.md)，英文版是 [`USER_GUIDE.md`](USER_GUIDE.md)。改观测、动作映射或 CAN 协议时看 [`开发文档.md`](开发文档.md)，英文版是 [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md)。训练数据采集的规定看 [`数据采集.md`](数据采集.md)。服务器上怎么加载微调数据看 [`服务器训练对接.md`](服务器训练对接.md)，英文版是 [`SERVER_TRAINING.md`](SERVER_TRAINING.md)。
+操作步骤看 [`用户文档.md`](用户文档.md)，英文版是 [`USER_GUIDE.md`](USER_GUIDE.md)。改观测、动作映射或 CAN 协议时看 [`开发文档.md`](开发文档.md)，英文版是 [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md)。训练数据采集的规定看 [`数据采集.md`](数据采集.md)。真机效果不好时，先核对下面的 [Real-robot data collection (required reading)](#real-robot-data-collection-required-reading)。服务器上怎么加载微调数据看 [`服务器训练对接.md`](服务器训练对接.md)，英文版是 [`SERVER_TRAINING.md`](SERVER_TRAINING.md)。
+
+## Real-robot data collection (required reading)
+
+> [!IMPORTANT]
+> **Required reading before you keep a real-robot take.** If you want the policy to work on the real arm, check every item below. These are the usual reasons a fine-tune looks trained and then fails on the robot.
+
+> [!CAUTION]
+> **Remove blank frames.** Idle frames — the arm sitting still, or an empty gap between motions — make the policy **overfit**. The standard symptom at inference is that **the arm does not move**.
+
+> [!CAUTION]
+> **Do not record the retract.** A take must not include the arm returning, folding back, or homing. That motion is not the task. Leaving it in makes the policy **underfit**.
+
+> [!IMPORTANT]
+> **Demonstrate as slowly as you can.** Collection stores one still from each camera at a time; those stills are later assembled into the training video. A slow demonstration gives every action a richer set of observations to condition on.
 
 ```mermaid
 flowchart LR
@@ -38,7 +52,7 @@ Stop the job and the forward with `python team_config.py down`. Check the arm wi
 
 On Windows, close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run.
 
-To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. That also rebuilds `datasets/piper_finetune`. See `用户文档.md`. With a leader arm on the same CAN bus, record with `python collect.py --leader --task "..."` instead (see `USER_GUIDE.md`). To replay the newest recording on the arm, run `python policy_link.py replay` (add `--loop` to repeat it).
+To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. That also appends the take to `datasets/piper_finetune`. See `用户文档.md`. With a leader arm on the same CAN bus, record with `python collect.py --leader --task "..."` instead (see `USER_GUIDE.md`). To replay the newest recording on the arm, run `python policy_link.py replay` (add `--loop` to repeat it).
 
 Python packages used here are `numpy`, `opencv-python`, `msgpack`, `websockets`, `python-can`, and AgileX's `pyAgxArm` (`pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"`). Recording also needs `pandas` and `pyarrow`. Mac also needs `pyusb`, `pyobjc-framework-AVFoundation`, and `brew install libusb`. All CAN traffic goes through `pyAgxArm`; `piper_can_bus.py` lets it use the candleLight over USB on Windows and macOS.
 
@@ -56,7 +70,7 @@ Python packages used here are `numpy`, `opencv-python`, `msgpack`, `websockets`,
 | `piper_can_bus.py` | CAN backend per platform for `pyAgxArm` |
 | `check_candidate_repo.py` | Search a candidate policy repo before changing the action mapping |
 | `_can_listen.py` | Receive-only CAN capture |
-| `collect.py` | Record, check, export, and rebuild `datasets/piper_finetune` after `s`. `--latest` does that for the newest episode |
+| `collect.py` | Record, check, export, and append the take to `datasets/piper_finetune` after `s`. `--latest` does that for the newest episode |
 | `episode_recorder.py` | Read-only drag-teach episode: arm feedback, one third-view and one wrist frame per control step, start and success or failure |
 | `episode_check.py` | Print the episode timeline and save pose curves beside both camera strips |
 | `dataset_export.py` | Resample a successful drag episode to 0.05 s. Intervals that are not teach mode, lack a fresh image from either camera, or jump are masked |

@@ -2,7 +2,7 @@
 
 `datasets/piper_finetune` is the fine-tune set for π0.5. The vectors are already in the model order used by `pi05_pretrain_human300`. Do not pass this folder to `LeRobotRobocasaDataConfig(DATASET_SOUP_REGISTRY["pretrain_human300"])`.
 
-On the collection computer, `collect.py` rebuilds this folder after a successful `s`. Rebuild only with `python prepare_dataset.py`. On a Mac, use `.venv/bin/python`.
+On the collection computer, `collect.py` appends the successful take to this folder after `s`. Rebuild the whole folder with `python prepare_dataset.py`. On a Mac, use `.venv/bin/python`.
 
 ## What to copy
 

@@ -31,8 +31,8 @@ python policy_link.py replay [episodes/episode_...] [--loop]  # --loop 一直重
 python episode_check.py episodes/episode_...   # 时间线和曲线检查
 python dataset_export.py episodes/episode_...  # 成功的 episode 导出 0.05 s 网格的 12 维动作和 mask；--self-check 不连臂
 python prepare_dataset.py          # 把所有成功 episode 整理成 datasets/piper_finetune；--self-check 不连臂
-python collect.py --task "..."     # 录一条，s 之后检查、导出并重建微调数据集
-python pointing.py collect [--task "..."] [--out DIR] [--dataset DIR]  # 指三条：SPACE 人手示范，SPACE 后约 2 s 等 REC 录主从，s/f/d 结束；人手部分存 episode 的 human_demo/，不训练；默认 episodes/pointing → datasets/pointing
+python collect.py --task "..."     # 录一条，s 之后检查、导出并把这一条追加进微调数据集
+python pointing.py collect [--task "..."] [--out DIR] [--dataset DIR]  # 指三条：倒计时后自动开始人手示范，任意键结束示范并在同一相机、同一时钟上接着录主从，s/f/d 结束臂的部分；人手部分存 human_demo/，不训练；成功的一条追加进 datasets/pointing
 python pointing.py infer [--ready] [--port N] [--speed PCT] [--freq HZ] [--observe-only --cycles 3]  # 主臂断电、服务器已 up；SPACE 人手示范，SPACE 策略动臂，Ctrl+C 停；示范存 episodes/pointing_runs，策略还看不到它
 python team_config.py run --server replay|openpi [--ready]  # 覆盖 server_mode；--ready 先展开到 READY_DEG
 python policy_link.py ready     # 只把臂展开到准备姿态（会动臂）

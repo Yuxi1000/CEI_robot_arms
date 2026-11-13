@@ -251,11 +251,18 @@ def _action(current, nxt, current_rotation, next_rotation):
     return values, mask
 
 
+# Drag on this arm stays CAN_CTRL or TEACHING, and teach_status stays 2 while the
+# person is moving it. teach_status == 1 never showed up on a real take, so it is
+# not a gate. A stationary arm is still refused by the path check below.
+DRAG_MODES = ("CAN_CTRL", "TEACHING")
+
+
 def demonstrating(collection_mode, ctrl_mode_name, teach_status):
     """Whether a feedback sample is part of the demonstration for this collection mode."""
+    del teach_status
     if collection_mode == "leader_follower":
         return ctrl_mode_name in FOLLOWING_MODES
-    return int(teach_status) == 1 and ctrl_mode_name == "TEACHING"
+    return ctrl_mode_name in DRAG_MODES
 
 
 def _interval_blocked(start_flags, end_flags):
@@ -281,10 +288,13 @@ def export_episode(episode_dir):
         raise RuntimeError("export accepts drag or leader_follower episodes whose labels come from the measured trajectory")
     if metadata.get("success") is not True:
         raise RuntimeError("export accepts an episode only after it is marked success")
-    feedback = pd.read_parquet(episode / "robot_feedback.parquet").sort_values("t_robot")
-    images = pd.read_parquet(episode / "image_timestamps.parquet").sort_values("t_image")
+    feedback = pd.read_parquet(episode / "robot_feedback.parquet")
+    # An episode with no complete feedback sample has a parquet with no columns at all,
+    # so this must come before sort_values, which would fail on the missing t_robot.
     if feedback.empty:
-        raise RuntimeError("episode has no arm feedback")
+        raise RuntimeError("episode has no arm feedback: the bus never delivered a complete state")
+    feedback = feedback.sort_values("t_robot")
+    images = pd.read_parquet(episode / "image_timestamps.parquet").sort_values("t_image")
     # Episodes recorded before the wrist camera was added have no wrist_file column.
     has_wrist = "wrist_file" in images.columns
     # Leader columns are recorded by --leader for diagnosis; no export decision reads them.
@@ -577,6 +587,7 @@ def _self_check_not_teaching(root):
         [(0.0, 0.0, 200.0), (40.0, 0.0, 200.0)],
         [80.0, 80.0],
         teach=0,
+        mode_name="STANDBY",
     )
     episode = root / "not_teaching"
     _write_synthetic(episode, feedback, 0.05)

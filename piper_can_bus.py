@@ -223,6 +223,8 @@ class _WinUsbTransport:
 
     def read(self, wait_ms=30):
         """Return one raw 20-byte gs_usb frame, or None."""
+        # _recv_internal passes a float millisecond remainder; WaitForSingleObject takes a DWORD.
+        wait_ms = max(0, int(wait_ms))
         overlapped = OVERLAPPED()
         overlapped.hEvent = self._read_event
         self._kernel.ResetEvent(self._read_event)

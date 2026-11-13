@@ -8,8 +8,9 @@ For master/slave teleoperation (this arm follows a leader arm on the same
 CAN bus), power on the follower, then the leader, and add --leader.
 
 Press s, f, or d in the same window when the attempt ends. Only s is exported.
-A successful export also rebuilds datasets/piper_finetune from every successful
-episode in this folder. To do that for the newest episode already on disk:
+A successful export appends that episode to datasets/piper_finetune. The whole
+dataset is rebuilt only when it is missing or out of date. To pack the newest
+episode already on disk:
 
     python collect.py --latest
 """
@@ -30,7 +31,7 @@ def newest_episode(out_dir):
 def finish_episode(episode, episodes_root, dest=None):
     from dataset_export import export_episode
     from episode_check import check_episode
-    from prepare_dataset import build_dataset
+    from prepare_dataset import DEST_DIR, append_episode
 
     episode = Path(episode)
     check_episode(episode)
@@ -39,10 +40,7 @@ def finish_episode(episode, episodes_root, dest=None):
         print(f"not exported success={metadata.get('success')} episode={episode}", flush=True)
         return
     export_episode(episode)
-    if dest is None:
-        build_dataset(episodes_root)
-    else:
-        build_dataset(episodes_root, dest)
+    append_episode(episode, episodes_root, DEST_DIR if dest is None else dest)
 
 
 def main():
